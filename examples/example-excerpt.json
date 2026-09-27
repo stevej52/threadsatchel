@@ -1,0 +1,18 @@
+{
+  "format": "threadsatchel/1",
+  "kind": "excerpt",
+  "title": "Synthetic sample archive",
+  "conversation_id": "example-conversation-not-a-real-chat",
+  "messages": [
+    {
+      "speaker": "user",
+      "message_id": "example-user-1",
+      "text": "This sample archive is synthetic. Where is the project checklist?"
+    },
+    {
+      "speaker": "assistant",
+      "message_id": "example-assistant-1",
+      "text": "The synthetic project checklist is in the example documentation. This is demonstration text, not a real memory."
+    }
+  ]
+}
