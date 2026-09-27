@@ -16,7 +16,9 @@ codex_capture.py is the original local collector; codex_capture_export.py extend
 
 capture_transport.py lists queued filtered packets and acknowledges validated hashes. sync_codex_capture.py runs configured SSH commands, verifies incoming hashes, preserves received packets centrally and calls the importer. Source acknowledgement occurs only after successful commits. It does not need database write access on source machines.
 
-install_schedule.py opts into one-minute Windows tasks or Linux systemd user timers. It uses ordinary user permissions and refuses to silently replace an existing job. Scheduling never invokes an AI model.
+install_schedule.py opts into one-minute capture/sync schedules or a two-minute inbox sweep, using Windows tasks or Linux systemd user timers. It uses ordinary user permissions and refuses to silently replace an existing job. Scheduling never invokes an AI model.
+
+inbox_sweep.py performs one bounded pass over finalized files directly inside inbox/. It uses the existing importer and its committed receipts, keeps content out of operational logs, retains failed files, and creates a verified pre-import SQLite backup before each batch that writes data. It does not execute deposited instructions or change reconciliation rules. See INBOX_SWEEP.md.
 
 ## Formats and compatibility
 

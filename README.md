@@ -14,6 +14,7 @@ A small, local memory archive that AI assistants can search through MCP. Keep or
 - Captures supported local Codex text events incrementally, without model/API calls.
 - Can queue capture on several machines and pull it into one archive over existing SSH connections.
 - Makes repeated imports safe and conservatively reconciles overlapping excerpts.
+- Optionally imports completed inbox files every two minutes using the same importer.
 
 ## Start here
 
@@ -38,6 +39,15 @@ python install_schedule.py local
 ```
 
 The installer is opt-in. Windows uses a limited task while your account is logged in; Linux uses a systemd user timer. See [capture and multi-machine setup](docs/CAPTURE.md).
+
+For optional automatic inbox imports:
+
+```sh
+python inbox_sweep.py
+python install_schedule.py inbox
+```
+
+Write a temporary `.incoming-<id>.json.part` file inside `inbox/`, then rename it to a new final `.json` filename after the write is complete. The sweep imports completed JSON, TXT, and Markdown files, retains originals and failures, skips existing import receipts, and records its results locally. See [inbox delivery and scheduling](docs/INBOX_SWEEP.md).
 
 ## How it fits together
 
