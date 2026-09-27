@@ -1,0 +1,19 @@
+{
+  "machines": [
+    {
+      "name": "laptop",
+      "capture_home": "/home/YOUR_USER/threadsatchel",
+      "ssh_argv": [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "ConnectTimeout=8",
+        "memory-laptop",
+        "python3 -"
+      ]
+    }
+  ]
+}
