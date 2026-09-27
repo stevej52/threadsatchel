@@ -1,0 +1,25 @@
+# Local archives, source conversations, and credentials must never be committed.
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+*.sqlite*
+*.db
+inbox/
+backups/
+handoffs/
+capture/
+queue/
+remote-capture/
+capture-local.json
+capture-export.json
+remote-capture-config.json
+*-results.json
+test-result.json
+*.jsonl
+*.zip
+*.pem
+*.key
+id_*
+known_hosts*
