@@ -5,6 +5,7 @@ import argparse
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import errno
 import hashlib
 import json
 import os
@@ -57,21 +58,32 @@ def dump_atomic(path, value):
     os.replace(temp, path)
 
 
+class CaptureLockBusy(OSError):
+    """Another writer owns this nonblocking capture lock; retry is safe."""
+
+
 @contextmanager
 def capture_lock(folder):
     folder.mkdir(parents=True, exist_ok=True)
     with (folder/'capture.lock').open('a+b') as f:
-        f.seek(0)
-        if not f.read(1):
+        # Windows denies reading an already locked byte. Use file metadata so
+        # contention is reported by the actual nonblocking acquisition below.
+        if os.fstat(f.fileno()).st_size == 0:
             f.write(b'0')
             f.flush()
         f.seek(0)
-        if os.name == 'nt':
-            import msvcrt
-            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if (getattr(error,'winerror',None) in (33,36) or
+                    error.errno in (errno.EACCES,errno.EAGAIN,errno.EDEADLK)):
+                raise CaptureLockBusy(error.errno,'Capture writer busy') from None
+            raise
         try:
             yield
         finally:

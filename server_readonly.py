@@ -55,4 +55,14 @@ def memory_ai_status() -> dict:
 
 
 if __name__ == '__main__':
-    mcp.run(transport='stdio')
+    try:
+        from memory_prewarm import start
+    except ImportError:
+        prewarm = None  # Core-only installations do not require optional AI files.
+    else:
+        prewarm = start(Path(DB).parent)
+    try:
+        mcp.run(transport='stdio')
+    finally:
+        if prewarm is not None:
+            prewarm.stop()

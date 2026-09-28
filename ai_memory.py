@@ -25,7 +25,12 @@ DEFAULTS = dict(enabled=False, embeddings=True, rerank=True,
     endpoint='http://127.0.0.1:8090', model='Qwen2.5-14B-Instruct',
     chat_timeout_seconds=25, projects={}, include_unassigned=True,
     embedding_endpoint='http://127.0.0.1:8091', embedding_threads=4,
-    embedding_timeout_seconds=20, max_chunks_per_pass=6, budget_seconds=90)
+    embedding_timeout_seconds=20, max_chunks_per_pass=6, budget_seconds=90,
+    idle_embeddings=False, idle_interval_seconds=60, idle_max_chunks=100,
+    idle_budget_seconds=20, idle_max_cpu_percent=25, idle_min_available_mb=8192,
+    prewarm_enabled=False, prewarm_interval_seconds=60, prewarm_startup_delay_seconds=5,
+    prewarm_budget_seconds=3, prewarm_max_projects=8,
+    health_checks_enabled=False, health_interval_seconds=21600, health_budget_seconds=8)
 KINDS = {'proposed', 'decided', 'observed', 'question', 'superseded', 'uncertain'}
 DIAGNOSTIC_LIMIT = 4096
 DIAGNOSTIC_CODES = frozenset('''success retry_requested legacy_held_error source_changed
@@ -192,6 +197,18 @@ def load_config(root):
     config = dict(DEFAULTS, **given)
     if not isinstance(config['projects'], dict):
         raise ValueError('projects must map project names to title/source terms')
+    for key in ('idle_embeddings','prewarm_enabled','health_checks_enabled'):
+        if type(config[key]) is not bool:
+            raise ValueError('Invalid background option: '+key)
+    for key,low,high in (
+            ('idle_interval_seconds',30,3600),('idle_max_chunks',1,100),
+            ('idle_budget_seconds',1,30),('idle_max_cpu_percent',1,80),
+            ('idle_min_available_mb',512,1048576),('prewarm_interval_seconds',15,3600),
+            ('prewarm_startup_delay_seconds',0,120),('prewarm_budget_seconds',1,15),
+            ('prewarm_max_projects',1,32),('health_interval_seconds',300,604800),
+            ('health_budget_seconds',1,30)):
+        if type(config[key]) is not int or not low<=config[key]<=high:
+            raise ValueError('Invalid background limit: '+key)
     return config
 
 
@@ -240,7 +257,7 @@ def archive_connect(root):
     return db
 
 
-def source_records(db):
+def source_records(db, *, deadline=None):
     # Read one snapshot; never rely on file mtime (WAL changes may not touch it).
     has_imports = db.execute("SELECT 1 FROM sqlite_master WHERE name='import_revisions'").fetchone()
     if has_imports:
@@ -252,6 +269,7 @@ def source_records(db):
         rows = db.execute('SELECT * FROM memories ORDER BY id')
     records = []
     for row in rows:
+        _check_read_deadline(deadline)
         record = dict(row)
         record['source_ids'] = {k: record.pop(k) for k in
             ('canonical_memory_id', 'conversation_id', 'message_id', 'speaker') if k in record}
@@ -350,9 +368,10 @@ def migrate_cache_payloads(cache, max_vectors=256):
     return report
 
 
-def current_sources(db, config):
-    records = [r for r in source_records(db) if project_for(r, config) is not None]
+def current_sources(db, config, *, deadline=None):
+    records = [r for r in source_records(db,deadline=deadline) if project_for(r, config) is not None]
     for record in records:
+        _check_read_deadline(deadline)
         record['_source_fingerprint']=source_fingerprint(record)
     version = digest(encoded([(r['id'], r['_source_fingerprint']) for r in records]))
     return records, version
@@ -395,6 +414,26 @@ def close_cached_readers(root=None):
         for key in list(_observers):
             if root is None or Path(root).resolve() in Path(key).parents:
                 _observers.pop(key)['db'].close()
+    # Explicit close/replacement is also an immediate invalidation boundary for
+    # bounded RAM snapshots; no old context survives an intentional reset.
+    target = str(Path(root).resolve()) if root is not None else None
+    for name, lock_name in (('_source_maps','_source_maps_lock'),('_briefs','_briefs_lock')):
+        memo, lock = globals().get(name), globals().get(lock_name)
+        if memo is not None:
+            with lock:
+                for key in list(memo):
+                    if target is None or key[0] == target:
+                        memo.pop(key)
+    function = globals().get('enhance_search')
+    if function is not None:
+        for name in ('_response_cache','_matrices'):
+            pair = function.__dict__.get(name)
+            if pair is not None:
+                lock,memo = pair
+                with lock:
+                    for key in list(memo):
+                        if target is None or key[0] == target:
+                            memo.pop(key)
 
 
 atexit.register(close_cached_readers)
@@ -406,34 +445,74 @@ def cache_generation(root):
         return entry['identity'],entry['epoch'],entry['db'].execute('PRAGMA data_version').fetchone()[0]
 
 
-def cached_sources(root, db, config, release_snapshot=False):
+def cached_sources(root, db, config, release_snapshot=False, *, deadline=None):
     if db.in_transaction and not release_snapshot:
         # Respect a caller's older transaction snapshot. It cannot share a current cache.
-        return current_sources(db, config)
+        return (current_sources(db, config, deadline=deadline) if deadline is not None
+                else current_sources(db, config))
     if db.in_transaction:
         db.rollback()
     mapping = encoded({k:config.get(k) for k in ('projects','include_unassigned')})
-    with _observers_lock:
-        entry = _observer(Path(root)/'memory.sqlite3')
-        reader = entry['db']
-        generation = reader.execute('PRAGMA data_version').fetchone()[0]
-        saved = entry['sources'].get(mapping)
-        if saved and saved[0] == generation:
-            return saved[1], saved[2]
-        for _ in range(3):
-            generation = reader.execute('PRAGMA data_version').fetchone()[0]
+    for _ in range(3):
+        _check_read_deadline(deadline)
+        with _observers_lock:
+            entry = _observer(Path(root)/'memory.sqlite3')
+            generation = entry['db'].execute('PRAGMA data_version').fetchone()[0]
+            identity = entry['identity'], entry['epoch']
+            saved = entry['sources'].get(mapping)
+            if saved and saved[0] == generation:
+                return saved[1], saved[2]
+        # Snapshot connections belong to this thread. The shared observer lock
+        # protects only short generation checks, never a full archive scan.
+        with closing(archive_connect(root)) as reader:
+            if deadline is not None:
+                reader.set_progress_handler(lambda: time.monotonic() >= deadline, 1000)
             reader.execute('BEGIN')
-            try:
-                records, version = current_sources(reader, config)
-            finally:
-                reader.rollback()
-            frozen = tuple(MappingProxyType(dict(r, source_ids=MappingProxyType(dict(r['source_ids']))))
-                           for r in records)
-            if reader.execute('PRAGMA data_version').fetchone()[0] == generation:
+            records, version = (current_sources(reader, config, deadline=deadline) if deadline is not None
+                                else current_sources(reader, config))
+            reader.rollback()
+        _check_read_deadline(deadline)
+        frozen = tuple(MappingProxyType(dict(r, source_ids=MappingProxyType(dict(r['source_ids']))))
+                       for r in records)
+        with _observers_lock:
+            entry = _observer(Path(root)/'memory.sqlite3')
+            if ((entry['identity'], entry['epoch']) == identity and
+                    entry['db'].execute('PRAGMA data_version').fetchone()[0] == generation):
                 entry['sources'] = {mapping:(generation, frozen, version)}
                 return frozen, version
-        # A busy archive still yields a consistent snapshot, but never a reusable stale cache.
-        return frozen, version
+    # A busy archive still yields a consistent snapshot, never a reusable stale cache.
+    return frozen, version
+
+
+def _check_read_deadline(deadline):
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError('Derived cache preparation budget exhausted')
+
+
+_source_maps = OrderedDict()
+_source_maps_lock = threading.RLock()
+
+
+def source_maps(root, records, version, config):
+    """Reuse immutable source-validation maps; no duplicate text or disk state."""
+    key = (str(Path(root).resolve()), version, config_fingerprint(config))
+    with _source_maps_lock:
+        saved = _source_maps.get(key)
+        if saved is not None:
+            _source_maps.move_to_end(key)
+            return saved
+    sources = {r['id']:r for r in records}
+    fingerprints = {r['id']:r.get('_source_fingerprint') or source_fingerprint(r) for r in records}
+    counts = {}
+    for record in records:
+        project = project_for(record, config)
+        counts[project] = counts.get(project, 0) + 1
+    saved = tuple(MappingProxyType(value) for value in (sources, fingerprints, counts))
+    with _source_maps_lock:
+        _source_maps[key] = saved
+        while len(_source_maps) > 2:
+            _source_maps.popitem(last=False)
+    return saved
 
 
 def sync_sources(cache, records, config, max_changed=None, deadline=None):
@@ -681,21 +760,39 @@ def validate_analysis(raw, record):
     return result
 
 
-def process(root, max_records=6, budget_seconds=90, chat_client=None, embedding_client=None, embeddings_only=False,chunk_ids=None,recover_analysis=False):
+def process(root, max_records=6, budget_seconds=90, chat_client=None, embedding_client=None, embeddings_only=False,chunk_ids=None,recover_analysis=False,should_continue=None):
     selected=validate_chunk_ids(chunk_ids)
     if type(recover_analysis) is not bool or (recover_analysis and (not selected or embeddings_only)):
         raise ValueError('Analysis recovery requires explicitly selected analysis chunks')
     root=Path(root);config=load_config(root)
     if not config['enabled']:
         return dict(enabled=False,state='off')
+    if should_continue is not None and not should_continue():
+        return dict(enabled=True,state='deferred',reason='resource_budget',
+                    indexed_chunks=0,embedded_chunks=0,analyzed_chunks=0)
     from codex_capture import capture_lock, dump_atomic
     runtime=root/'.ai-cache';runtime.mkdir(exist_ok=True)
     with capture_lock(runtime):
         with closing(archive_connect(root)) as source, closing(cache_connect(root,True)) as cache:
             started=time.monotonic()
-            source.execute('BEGIN')
-            records,version=current_sources(source,config)
-            source.rollback()
+            if should_continue is not None:
+                source.set_progress_handler(lambda: int(time.monotonic()>=started+budget_seconds),1000)
+            try:
+                source.execute('BEGIN')
+                records,version=(current_sources(source,config,deadline=started+budget_seconds)
+                                 if should_continue is not None else current_sources(source,config))
+            except (TimeoutError,sqlite3.OperationalError) as error:
+                if should_continue is not None and (isinstance(error,TimeoutError) or
+                        getattr(error,'sqlite_errorcode',None)==sqlite3.SQLITE_INTERRUPT):
+                    return dict(enabled=True,state='deferred',reason='source_budget',
+                        indexed_chunks=0,embedded_chunks=0,analyzed_chunks=0)
+                raise
+            finally:
+                source.rollback()
+                source.set_progress_handler(None,0)
+            if should_continue is not None and not should_continue():
+                return dict(enabled=True,state='deferred',reason='resource_budget',
+                    indexed_chunks=0,embedded_chunks=0,analyzed_chunks=0)
             indexed=0 if selected else sync_sources(cache,records,config,max_changed=128,deadline=started+budget_seconds)
             cfgversion=config_fingerprint(config)
             previous=cache.execute("SELECT value FROM state WHERE key='config_version'").fetchone()
@@ -756,6 +853,8 @@ def process(root, max_records=6, budget_seconds=90, chat_client=None, embedding_
             for row in rows:
                 if time.monotonic()-started>budget_seconds or not load_config(root)['enabled']:
                     report['state']='partial';break
+                if should_continue is not None and not should_continue():
+                    report.update(state='deferred',reason='resource_budget');break
                 chunk=dict(row)
                 if recover_analysis:
                     if not chunk['analysis_retry_requested']:
@@ -805,20 +904,31 @@ def process(root, max_records=6, budget_seconds=90, chat_client=None, embedding_
                             code,details=failure_diagnostic(error,'analysis')
                             report['diagnostics'].append(record_diagnostic(cache,chunk['id'],'analysis','failed',chunk['attempts']+1,code,details))
                         report['errors'].append('analysis_'+kind)
-            if not selected:
+            # An idle pass must yield before optional briefing work when its
+            # resource/time allowance ends. Existing briefs remain source-checked.
+            prepare_briefs=(should_continue is None or
+                (time.monotonic()<started+budget_seconds and should_continue()))
+            if not selected and prepare_briefs:
                 with cache:
-                    cache.execute('INSERT OR REPLACE INTO state VALUES(?,?)',('archive_version',version))
-                    if not selected:cache.execute('INSERT OR REPLACE INTO state VALUES(?,?)',('config_version',cfgversion))
+                    # No-op passes must not evict every foreground retrieval cache.
+                    for key,value in (('archive_version',version),('config_version',cfgversion)):
+                        cache.execute('INSERT INTO state VALUES(?,?) ON CONFLICT(key) DO UPDATE '
+                            'SET value=excluded.value WHERE state.value!=excluded.value',(key,value))
                     # All precomputed briefings carry both archive and configuration generation.
                     cache.execute('DELETE FROM responses WHERE archive_version!=? OR config_version!=?',(version,cfgversion))
                     for project in sorted({project_for(r,config) for r in records}):
+                        if should_continue is not None and (time.monotonic()>=started+budget_seconds or not should_continue()):
+                            report.update(state='deferred',reason='resource_budget');break
                         brief=build_brief(cache,project,cfgversion)
                         total_records=sum(project_for(r,config)==project for r in records)
                         indexed_records=cache.execute('SELECT count(*) FROM records WHERE project=?',(project,)).fetchone()[0]
                         brief['coverage'].update(indexed_records=indexed_records,total_records=total_records)
                         if indexed_records<total_records and brief['state']=='ready':brief['state']='partial'
                         brief.update(source_fingerprint=version)
-                        cache.execute('INSERT OR REPLACE INTO responses VALUES(?,?,?,?)',
+                        cache.execute('INSERT INTO responses VALUES(?,?,?,?) ON CONFLICT(key) DO UPDATE '
+                            'SET archive_version=excluded.archive_version,config_version=excluded.config_version,'
+                            'result=excluded.result WHERE responses.archive_version!=excluded.archive_version '
+                            'OR responses.config_version!=excluded.config_version OR responses.result!=excluded.result',
                             ('brief:'+project,version,cfgversion,encoded(brief)))
             fingerprints={r['id']:r.get('_source_fingerprint') or source_fingerprint(r) for r in records}
             indexed_current=sum(fingerprints.get(r['id'])==r['fingerprint'] for r in cache.execute('SELECT id,fingerprint FROM records'))
@@ -828,6 +938,7 @@ def process(root, max_records=6, budget_seconds=90, chat_client=None, embedding_
                 pending_embeddings=cache.execute("SELECT count(*) FROM chunks WHERE vector IS NULL OR (?!='' AND coalesce(embedding_version,'')!=?)",(ev,ev)).fetchone()[0])
             if report['state']=='ok' and (report['pending_source_records'] or report['pending_analysis'] or (config['embeddings'] and report['pending_embeddings'])):
                 report['state']='partial'
+            report['elapsed_seconds']=round(time.monotonic()-started,3)
             dump_atomic(runtime/'last-run.json',report)
             return report
 
@@ -872,39 +983,60 @@ def build_brief(cache, project, cfgversion):
         'Proposals never automatically replace decisions; conflicting decisions require source review.')
 
 
-def project_brief(root, db, project):
+_briefs = OrderedDict()
+_briefs_lock = threading.RLock()
+
+
+def project_brief(root, db, project, *, deadline=None):
     config=load_config(root)
     if not config['enabled']:
         return dict(project=project,state='off',generated=False)
     try:
-        records,version=cached_sources(root,db,config)
+        records,version=cached_sources(root,db,config,deadline=deadline)
         cfgversion=config_fingerprint(config)
+        generation=cache_generation(root)
+        key=(str(Path(root).resolve()),version,cfgversion,generation,project)
+        with _briefs_lock:
+            saved=_briefs.get(key)
+            if saved is not None:
+                _briefs.move_to_end(key)
+                return json.loads(saved)
+        _,fingerprints,project_counts=source_maps(root,records,version,config)
+        def prepared(brief):
+            # Each caller gets its own response; mutating it cannot poison RAM.
+            payload=encoded(brief)
+            if len(payload)<=256*1024 and cache_generation(root)==generation:
+                with _briefs_lock:
+                    _briefs[key]=payload
+                    while len(_briefs)>32:_briefs.popitem(last=False)
+            return brief
         with closing(cache_connect(root)) as cache:
+            if deadline is not None:
+                cache.set_progress_handler(lambda: time.monotonic()>=deadline,1000)
             row=cache.execute('SELECT * FROM responses WHERE key=?',('brief:'+project,)).fetchone()
+            _check_read_deadline(deadline)
             if row and row['config_version']==cfgversion:
                 brief=json.loads(row['result'])
                 # Continuous capture need not hide unchanged evidence. Every cited
                 # source, including a summary's source, must still match exactly.
                 # Older caches without per-evidence hashes fail closed here.
-                fingerprints={record['id']:record.get('_source_fingerprint') or source_fingerprint(record)
-                    for record in records}
                 evidence=[*brief.get('facts',[]),*brief.get('summaries',[])]
                 valid_evidence=all(
                     item.get('source_fingerprint') and
                     fingerprints.get(item.get('memory_id'))==item['source_fingerprint']
                     for item in evidence)
                 if row['archive_version']==version and valid_evidence:
-                    return brief
+                    return prepared(brief)
                 if brief.get('generated') and evidence and valid_evidence:
                     brief.update(state='partial',freshness='source_updates_pending',
                         current_source_fingerprint=version)
                     brief['coverage']=dict(brief.get('coverage',{}),work_pending=True,
-                        current_source_records=sum(project_for(record,config)==project for record in records))
+                        current_source_records=project_counts.get(project,0))
                     brief['caution']=(brief.get('caution','')+' Additional or changed archive sources '
                         'await processing and may contradict this earlier evidence. This partial brief '
                         'does not establish the latest decisions; await refresh or inspect original sources.')
-                    return brief
-        return dict(project=project,state='pending',generated=False,reason='source_or_configuration_changed')
+                    return prepared(brief)
+        return prepared(dict(project=project,state='pending',generated=False,reason='source_or_configuration_changed'))
     except (sqlite3.Error,OSError):
         return dict(project=project,state='pending',generated=False,reason='derived_cache_unavailable')
 
@@ -913,6 +1045,49 @@ def _compact(record, text):
     return dict(id=record['id'],title=(record.get('title') or '')[:240] or None,
         source=record['source'][:240],
         created_at=record['created_at'],text=text[:600],source_ids=dict(record.get('source_ids',{})))
+
+
+def cached_vector_index(root, generation, model_fingerprint, *, deadline=None, allow_snapshot_reuse=False):
+    """Reuse a consistent vector snapshot during a bounded derived refresh window.
+
+    Current original-source fingerprints remain authoritative on every query.
+    Opt-in snapshot reuse exposes new derived vectors within 30 seconds; this
+    avoids repeatedly rebuilding a whole matrix as a background worker commits.
+    Model identity and database replacement always invalidate immediately.
+    """
+    from ai_embeddings import VectorIndex
+    lock,matrices=enhance_search.__dict__.setdefault('_matrices',(threading.RLock(),OrderedDict()))
+    key=(str(Path(root).resolve()),generation[:2],model_fingerprint)
+    with lock:
+        saved=matrices.get(key)
+        if saved is not None and (saved[0]==generation or
+                (allow_snapshot_reuse and time.monotonic()-saved[1]<30)):
+            matrices.move_to_end(key)
+            if saved[0]==generation:
+                matrices[key]=(saved[0],time.monotonic(),saved[2])
+            return saved[2]
+    groups={};evidence={}
+    with closing(cache_connect(root)) as cache:
+        if deadline is not None:
+            cache.set_progress_handler(lambda: time.monotonic()>=deadline,1000)
+        rows=cache.execute('SELECT c.id,c.memory_id,c.vector,r.fingerprint FROM chunks c '
+            'JOIN records r ON r.id=c.memory_id WHERE c.vector IS NOT NULL AND c.embedding_version=?',
+            (model_fingerprint,))
+        def stored_vectors():
+            for row in rows:
+                _check_read_deadline(deadline)
+                groups[row['id']]=row['memory_id']
+                evidence[row['id']]=row['fingerprint']
+                yield row['id'],row['vector']
+        index=VectorIndex(stored_vectors())
+    _check_read_deadline(deadline)
+    saved=(index,MappingProxyType(groups),MappingProxyType(evidence))
+    after=cache_generation(root)
+    if after[:2]==generation[:2]:
+        with lock:
+            matrices[key]=(generation if after==generation else None,time.monotonic(),saved)
+            while len(matrices)>2:matrices.popitem(last=False)
+    return saved
 
 
 def enhance_search(root, db, query, hits, limit, *, release_snapshot=False):
@@ -940,12 +1115,11 @@ def enhance_search(root, db, query, hits, limit, *, release_snapshot=False):
         return hits[:limit]
     root=Path(root)
     memo_lock,memo=enhance_search.__dict__.setdefault('_response_cache',(threading.RLock(),OrderedDict()))
-    matrix_lock,matrices=enhance_search.__dict__.setdefault('_matrices',(threading.RLock(),OrderedDict()))
     try:
+        response_cached_at=time.monotonic()
         generation=cache_generation(root)
         records,version=cached_sources(root,db,config,release_snapshot=release_snapshot)
-        sources={r['id']:r for r in records}
-        fingerprints={r['id']:r.get('_source_fingerprint') or source_fingerprint(r) for r in records}
+        sources,fingerprints,_=source_maps(root,records,version,config)
         cfgversion=config_fingerprint(config)
         retrieval_settings=digest(encoded({k:config.get(k) for k in
             ('embeddings','rerank','embedding_endpoint','embedding_model_path')}))
@@ -956,8 +1130,10 @@ def enhance_search(root, db, query, hits, limit, *, release_snapshot=False):
             if not model_path.is_absolute():model_path=root/model_path
             info=model_path.stat()
             model_signature=(_file_identity(model_path),info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+        allow_snapshot_reuse=config.get('prewarm_enabled',False)
+        response_generation=generation[:2] if allow_snapshot_reuse else generation
         key=(str(root.resolve()),version,cfgversion,retrieval_settings,query,limit,
-             digest(encoded(hits)),generation,model_signature)
+             digest(encoded(hits)),response_generation,model_signature)
         with memo_lock:
             saved=memo.get(key)
             if saved and time.monotonic()-saved[0]<30:
@@ -1008,32 +1184,21 @@ def enhance_search(root, db, query, hits, limit, *, release_snapshot=False):
             has_vectors=config['embeddings'] and cache.execute('SELECT 1 FROM chunks WHERE vector IS NOT NULL LIMIT 1').fetchone()
         if has_vectors:
             try:
-                from ai_embeddings import EmbeddingClient,VectorIndex
+                from ai_embeddings import EmbeddingClient
                 query_config=dict(config,embedding_timeout_seconds=2)
                 with EmbeddingClient(query_config,root) as client:
                     client.ensure_ready(allow_launch=False)
                     vector=client.embed([query],query=True)[0]
-                    matrix_key=(str(root.resolve()),generation,client.model_fingerprint)
+                    index,groups,evidence=cached_vector_index(root,generation,client.model_fingerprint,
+                        allow_snapshot_reuse=allow_snapshot_reuse)
+                    matrix_lock,matrices=enhance_search.__dict__['_matrices']
                     with matrix_lock:
-                        saved=matrices.get(matrix_key)
-                    if saved is None:
-                        groups={};evidence={}
-                        with closing(cache_connect(root)) as cache:
-                            rows=cache.execute('SELECT c.id,c.memory_id,c.vector,r.fingerprint FROM chunks c '
-                                'JOIN records r ON r.id=c.memory_id WHERE c.vector IS NOT NULL AND c.embedding_version=?',
-                                (client.model_fingerprint,))
-                            def stored_vectors():
-                                for row in rows:
-                                    groups[row['id']]=row['memory_id']
-                                    evidence[row['id']]=row['fingerprint']
-                                    yield row['id'],row['vector']
-                            index=VectorIndex(stored_vectors())
-                        saved=(index,groups,evidence)
-                        if cache_generation(root)==generation:
-                            with matrix_lock:
-                                matrices[matrix_key]=saved
-                                while len(matrices)>2:matrices.popitem(last=False)
-                    index,groups,evidence=saved
+                        snapshot=matrices.get((str(root.resolve()),generation[:2],client.model_fingerprint))
+                        # Do not add another response TTL to an older matrix TTL.
+                        # If evicted meanwhile, this result is deliberately not memoized.
+                        snapshot_time=(snapshot[1] if snapshot and snapshot[2][0] is index
+                                       else time.monotonic()-30)
+                        response_cached_at=min(response_cached_at,snapshot_time)
                     allowed={cid for cid,mid in groups.items() if fingerprints.get(mid)==evidence[cid]}
                     ranked=[(cid,score) for cid,score in index.top_k(vector,k=max(20,limit),groups=groups,allowed=allowed) if score>=.35]
                 ids=[cid for cid,_ in ranked]
@@ -1050,11 +1215,15 @@ def enhance_search(root, db, query, hits, limit, *, release_snapshot=False):
             try:result=LocalChat(config).rank(query,result)
             except Exception:pass
         result=result[:limit]
-        if cache_generation(root)==generation:
+        # With prewarming enabled, a derived commit may wait for the existing TTL.
+        # Archive/config/model changes are independent parts of the key and do
+        # not inherit this delay; replacing the derived database also invalidates.
+        after=cache_generation(root)
+        if (after[:2]==generation[:2] if allow_snapshot_reuse else after==generation):
             payload=encoded(result)
             if len(payload)<=65536:
                 with memo_lock:
-                    memo[key]=(time.monotonic(),payload)
+                    memo[key]=(response_cached_at,payload)
                     memo.move_to_end(key)
                     while len(memo)>32:memo.popitem(last=False)
         return result
@@ -1071,6 +1240,21 @@ def status(root, db):
     result=dict(enabled=config['enabled'],embeddings=config['embeddings'],rerank=config['rerank'],
         generated_cache='.ai-cache/index.sqlite3',authoritative_archive='memory.sqlite3',
         projects=list(config['projects']),pipeline_version=VERSION,generation_protocol=GENERATION_PROTOCOL)
+    result['background']={key:config[key] for key in (
+        'idle_embeddings','idle_interval_seconds','idle_max_chunks','idle_budget_seconds',
+        'idle_max_cpu_percent','idle_min_available_mb','prewarm_enabled',
+        'prewarm_interval_seconds','prewarm_max_projects','health_checks_enabled',
+        'health_interval_seconds','health_budget_seconds')}
+    try:
+        from memory_prewarm import status as prewarm_status
+        result['prewarm']=prewarm_status(root)
+        from memory_health import read_health
+        health=read_health(root)
+        if health:
+            result['health']={key:health[key] for key in ('state','completed_at','elapsed_seconds',
+                'full_archive_verified','repairs_attempted') if key in health}
+    except (ImportError,OSError,ValueError):
+        pass
     if not config['enabled']:return result
     try:
         with closing(cache_connect(root)) as cache:

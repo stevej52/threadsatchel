@@ -542,7 +542,7 @@ class EmbeddingClient:
         kwargs = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                       stderr=subprocess.DEVNULL, cwd=str(binary.parent), env=environment)
         if os.name == 'nt':
-            kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+            kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS
         else:
             kwargs['start_new_session'] = True
         try:

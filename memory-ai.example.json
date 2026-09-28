@@ -13,5 +13,19 @@
   "embedding_threads": 4,
   "embedding_timeout_seconds": 20,
   "max_chunks_per_pass": 6,
-  "budget_seconds": 90
+  "budget_seconds": 90,
+  "idle_embeddings": false,
+  "idle_interval_seconds": 60,
+  "idle_max_chunks": 100,
+  "idle_budget_seconds": 20,
+  "idle_max_cpu_percent": 25,
+  "idle_min_available_mb": 8192,
+  "prewarm_enabled": false,
+  "prewarm_interval_seconds": 60,
+  "prewarm_startup_delay_seconds": 5,
+  "prewarm_budget_seconds": 3,
+  "prewarm_max_projects": 8,
+  "health_checks_enabled": false,
+  "health_interval_seconds": 21600,
+  "health_budget_seconds": 8
 }

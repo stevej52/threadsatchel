@@ -73,6 +73,70 @@ Passes alternate between configured projects so a stream of recent messages in o
 
 After a manual bounded pass succeeds, Windows users can opt into the schedule with `python memory_ai.py install-schedule`. This installs ordinary user tasks for processing and the embedding service owner every five minutes, with overlapping runs suppressed. Existing tasks are not silently replaced. Disabling AI is sufficient to prevent new scheduled passes from calling a model. Other systems can invoke the same commands through their user scheduler.
 
+## Optional idle CPU and RAM use
+
+The following features are opt-in and require no additional model, paid API, database,
+Windows service, or scheduled task. They reuse the existing embedding owner and MCP
+processes. The example configuration leaves all three switches off; set
+`idle_embeddings`, `prewarm_enabled`, and `health_checks_enabled` to `true` to enable
+the four capabilities below. The main `enabled` switch still controls optional AI.
+Back up your runtime configuration before editing it.
+
+- **Extra semantic indexing:** the existing CPU embedding owner performs up to
+  100 chunks or 20 seconds of indexing, then waits at least 60 seconds. It keeps
+  four embedding threads by default and never requests chat analysis during these
+  extra passes. Windows worker/child priority is reduced. The existing processor
+  lock prevents overlapping writers; ordinary scheduled processing waits briefly
+  for an idle pass to finish.
+- **Warm retrieval caches:** each persistent MCP process prepares source maps and
+  vector matrices after a five-second startup delay, then every 60 seconds, with
+  a three-second soft work budget. This preparation does not contact a model or
+  generate embeddings. Existing vector limits remain two matrices of at most
+  128 MiB of raw vectors each; this is a maximum, not a memory reservation.
+- **Health checks:** the embedding owner runs an eight-second, read-only health
+  pass every six hours. It checks database/search-index consistency and rotating
+  samples of source hashes, original retained bytes, source quotations, vectors,
+  and one discovered SQLite backup. It records missing/stale AI coverage separately
+  from corruption. It never repairs, merges, deletes, or reimports source memory.
+- **Prepared project context:** the warmer prepares owner-configured project briefs
+  and the general brief, up to eight projects. The existing `get_project_brief`
+  tool serves these bounded, source-validated RAM copies. It preserves partial
+  coverage, conflicting evidence, and uncertainty; it does not invent a current
+  decision or run extra Qwen generation. Brief storage is capped at 32 entries of
+  at most 256 KiB each. The ordinary Qwen task continues building their contents.
+
+Background work starts only when measured whole-machine CPU is at most 25% and
+at least 8 GiB of physical RAM is available. Extra indexing checks again between
+chunks. Native resource counters currently support Windows; unavailable counters
+defer optional background work. Manual retrieval and manual health checks remain
+usable. Limits are configurable within validated bounds; they are safety margins,
+not claims of optimal performance. A model request already in flight may finish
+after a switch or budget changes (idle embedding requests are capped at five
+seconds). A single OS/storage call may also exceed a soft deadline.
+
+With prewarming enabled, derived-only indexing changes may take up to 30 seconds to affect a cached
+search ranking; vector and response lifetimes do not accumulate. Changed or removed
+original sources, model identities, and interpretation settings invalidate the
+applicable results immediately on the next request. Every vector candidate still
+has to match its original source fingerprint. Project briefs retain strict source
+and derived-generation validation. This prevents an active indexing pass from
+forcing expensive matrix rebuilding on every foreground query.
+
+`python memory_ai.py status` includes the configured limits and latest health summary.
+Through an MCP connection, `memory_ai_status` also reports that process's warmer.
+The embedding owner writes metadata-only `.ai-cache/last-idle-run.json` and
+`.ai-cache/health-report.json`; neither contains conversation text or credentials.
+An `attention` health result can mean expected indexing backlog. A partial/skipped
+check is not a full verification. Sampled backup checks do not prove that all
+backups are current, complete, or restore-tested.
+
+Run a manual diagnostic pass with `python memory_ai.py health`. Restart an existing
+embedding owner and reconnect existing MCP clients after updating program files;
+already-running Python processes retain their loaded code. Disabling the three
+switches stops future work without deleting caches or memories. Disabling the main
+AI switch also stops its owned CPU embedding server. It never stops a separate robot
+chat service.
+
 ## Evidence and decisions
 
 Model-derived facts are suggestions, not new source authority. Each accepted fact carries an original memory reference and a quotation that must appear literally in that source. A valid quotation establishes where the words came from; it does not prove that a model's interpretation is correct. Open the cited source when a distinction matters.

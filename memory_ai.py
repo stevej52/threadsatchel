@@ -11,7 +11,8 @@ import sys
 import time
 from ai_memory import (archive_connect, cache_connect, diagnostic_history, load_config, process,
                        project_brief, record_diagnostic, status, validate_chunk_ids)
-from codex_capture import capture_lock, dump_atomic
+from codex_capture import CaptureLockBusy, capture_lock, dump_atomic
+from memory_resources import ResourceMonitor, lower_process_priority, resource_reason
 
 ROOT=Path(__file__).resolve().parent
 
@@ -45,9 +46,82 @@ def set_enabled(root, enabled):
     return dict(enabled=enabled,configuration=str(path))
 
 
+def _writer_busy(error):
+    """Only a nonblocking capture-lock acquisition is normal contention."""
+    return isinstance(error,CaptureLockBusy)
+
+
+def process_with_lock_retry(root, *, retry_seconds=30, **kwargs):
+    """Give the normal five-minute job time to follow a short idle writer."""
+    deadline=time.monotonic()+retry_seconds
+    while True:
+        try:return process(root,**kwargs)
+        except OSError as error:
+            if not _writer_busy(error):raise
+            remaining=deadline-time.monotonic()
+            if remaining<=0:return dict(enabled=True,state='deferred',reason='writer_busy')
+            time.sleep(min(0.5,remaining))
+
+
+def run_idle_embeddings(root, config, monitor, client):
+    """One guarded CPU-only pass through the existing authoritative processor."""
+    started=time.monotonic()
+    report=dict(state='deferred',at=datetime.now(timezone.utc).isoformat(),
+                indexed_chunks=0,embedded_chunks=0,analyzed_chunks=0)
+    reason=None
+    def allowed():
+        nonlocal reason
+        latest=load_config(root)
+        if not latest['enabled'] or not latest['embeddings'] or not latest.get('idle_embeddings',False):
+            reason='disabled';return False
+        reason=resource_reason(latest,monitor.sample())
+        return reason is None
+    previous_timeout=client.timeout
+    try:
+        if allowed():
+            # An in-flight request can finish at most five seconds after the pass
+            # budget/switch changes. Never start a GPU analysis or another server.
+            client.timeout=min(previous_timeout,5,config.get('idle_budget_seconds',20))
+            result=process(root,max_records=config.get('idle_max_chunks',100),
+                budget_seconds=config.get('idle_budget_seconds',20),embeddings_only=True,
+                embedding_client=client,should_continue=allowed)
+            if result.get('state') in ('ok','partial','deferred','off'):
+                report['state']=result['state']
+            for key in ('indexed_chunks','embedded_chunks','analyzed_chunks','pending_source_records',
+                        'pending_embeddings','held_embeddings'):
+                value=result.get(key)
+                if type(value) is int and value>=0:report[key]=value
+            report['error_count']=len(result.get('errors',[]))
+        if reason:report['reason']=reason
+    except Exception as error:
+        if _writer_busy(error):report.update(state='deferred',reason='writer_busy')
+        else:report.update(state='failed',error_type=type(error).__name__)
+    finally:
+        client.timeout=previous_timeout
+    report['elapsed_seconds']=round(time.monotonic()-started,3)
+    dump_atomic(Path(root)/'.ai-cache'/'last-idle-run.json',report)
+    return report
+
+
+def run_due_health(root, config, monitor):
+    """Read-only, infrequent checks remain independent of idle embeddings."""
+    try:
+        config=load_config(root)
+        if not config['enabled'] or not config.get('health_checks_enabled',False):return
+        if resource_reason(config,monitor.sample()):return
+        from memory_health import health_due, run_health
+        if health_due(root,config.get('health_interval_seconds',21600)):
+            return run_health(root,budget_seconds=config.get('health_budget_seconds',8))
+    except Exception as error:
+        # Never log exception text, file content, model text, or configuration.
+        dump_atomic(Path(root)/'.ai-cache'/'last-health-worker.json',
+            dict(state='failed',error_type=type(error).__name__,at=datetime.now(timezone.utc).isoformat()))
+
+
 def embeddings_daemon(root):
     """Optional CPU worker, limited to a local child we own; switch-off stops it."""
     from ai_embeddings import EmbeddingClient
+    root=Path(root)
     runtime=root/'.ai-cache'/'embedding-owner'
     runtime.mkdir(parents=True,exist_ok=True)
     with capture_lock(runtime):
@@ -55,11 +129,24 @@ def embeddings_daemon(root):
         try:
             config=load_config(root)
             if not config['enabled'] or not config['embeddings']:return
+            lower_process_priority()
+            monitor=ResourceMonitor()
+            monitor.sample()  # Establish a CPU baseline before approving work.
             client=EmbeddingClient(config,root)
             client.ensure_ready()
-            while load_config(root)['enabled'] and load_config(root)['embeddings']:
+            next_idle=next_health=0
+            while True:
                 time.sleep(3)
+                config=load_config(root)
+                if not config['enabled'] or not config['embeddings']:break
+                monitor.sample()
                 client.ensure_ready()
+                if config.get('idle_embeddings',False) and time.monotonic()>=next_idle:
+                    run_idle_embeddings(root,config,monitor,client)
+                    next_idle=time.monotonic()+config.get('idle_interval_seconds',60)
+                if time.monotonic()>=next_health:
+                    run_due_health(root,config,monitor)
+                    next_health=time.monotonic()+60
         finally:
             if client:client.close()
 
@@ -89,7 +176,7 @@ def install_schedule(root):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action',choices=['on','off','status','process','brief','embeddings','install-schedule','retry-held','diagnostics'])
+    parser.add_argument('action',choices=['on','off','status','process','brief','embeddings','install-schedule','retry-held','diagnostics','health'])
     parser.add_argument('project',nargs='?',default='general')
     parser.add_argument('--max-chunks',type=int,default=None)
     parser.add_argument('--budget-seconds',type=int,default=None)
@@ -103,13 +190,16 @@ def main():
         elif args.action=='install-schedule':result=install_schedule(ROOT)
         elif args.action=='retry-held':result=retry_held(ROOT,chunk_ids=args.chunk_ids)
         elif args.action=='diagnostics':result={'events':diagnostic_history(ROOT,chunk_ids=args.chunk_ids)}
+        elif args.action=='health':
+            from memory_health import run_health
+            result=run_health(ROOT,budget_seconds=load_config(ROOT).get('health_budget_seconds',8))
         elif args.action=='embeddings':
             embeddings_daemon(ROOT);result={'state':'stopped'}
         elif args.action=='process':
             config=load_config(ROOT)
             if args.max_chunks is None and not args.embeddings_only and not args.chunk_ids:
-                process(ROOT,max_records=64,budget_seconds=40,embeddings_only=True)
-            result=process(ROOT,max_records=args.max_chunks or (len(args.chunk_ids) if args.chunk_ids else config['max_chunks_per_pass']),
+                process_with_lock_retry(ROOT,max_records=64,budget_seconds=40,embeddings_only=True)
+            result=process_with_lock_retry(ROOT,max_records=args.max_chunks or (len(args.chunk_ids) if args.chunk_ids else config['max_chunks_per_pass']),
                 budget_seconds=args.budget_seconds or config['budget_seconds'],embeddings_only=args.embeddings_only,
                 chunk_ids=args.chunk_ids,recover_analysis=args.recover_analysis)
         elif args.action=='status':result=status(ROOT,None)

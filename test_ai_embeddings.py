@@ -230,7 +230,8 @@ class EmbeddingTests(unittest.TestCase):
             self.assertNotIn('LLAMA_ARG_RPC', kwargs['env'])
             self.assertNotIn('LLAMA_API_KEY', kwargs['env'])
             if os.name == 'nt':
-                self.assertEqual(kwargs['creationflags'], embeddings.subprocess.CREATE_NO_WINDOW)
+                self.assertEqual(kwargs['creationflags'], embeddings.subprocess.CREATE_NO_WINDOW |
+                                 embeddings.subprocess.BELOW_NORMAL_PRIORITY_CLASS)
             self.client.close()
             self.assertTrue(process.terminated)
             if os.name == 'nt':
