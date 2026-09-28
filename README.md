@@ -34,7 +34,7 @@ python setup_memory.py
 python import_memory.py examples/example-excerpt.json
 ```
 
-Connect your MCP client to the absolute path of `.venv`'s Python executable, with the absolute path of `server_readonly.py` as its argument. Ask it to search for **sample archive** to check the example import. See [connection instructions](docs/CONNECTING.md), including Codex configuration.
+Connect your MCP client to the absolute path of `.venv`'s Python executable, with the absolute path of `server_readonly.py` as its argument. Ask it to search for **sample archive** to check the example import. See [connection instructions](docs/CONNECTING.md), including Codex configuration. For ordinary ChatGPT or other model-driven clients, also install the [recommended standing instructions](docs/STANDING_INSTRUCTIONS.md); without client-side capture, MCP access alone does not automatically save completed chat turns.
 
 For optional automatic local capture:
 
