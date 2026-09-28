@@ -4,7 +4,16 @@
 
 Run setup_memory.py once before connecting the read-only endpoint. It creates memory.sqlite3 beside the source files. Use absolute paths; the working directory of your AI client does not choose the database.
 
-The recommended endpoint is server_readonly.py. It exposes only search_memory(query) and get_memory(id), opens SQLite with mode=ro and query_only, and refuses to create a missing database.
+The recommended endpoint is `server_readonly.py`. It opens the authoritative SQLite archive with `mode=ro` and `query_only`, refuses to create a missing database, and exposes four read-only tools:
+
+| Tool | Purpose |
+| --- | --- |
+| `search_memory(query, limit=20, full=False)` | Search ranked excerpts; `full=True` returns the full originals for the same ranked results. |
+| `get_memory(id)` | Retrieve one full original and its provenance. |
+| `get_project_brief(project)` | Read a prepared optional AI brief with source references, coverage and freshness information. |
+| `memory_ai_status()` | Inspect optional AI settings, indexing progress and this MCP process's cache warmer. |
+
+The [Qwen helper](OPTIONAL_QWEN.md) is off by default. Ordinary search and retrieval need no model. Enabling it can add derived search aids and semantic ranking to `search_memory`; brief retrieval reads prepared results and does not run new chat-model inference. The brief/status tools remain available when AI is off and report its disabled state. Connecting this endpoint does not enable AI, start model services, import files or rewrite original memories.
 
 ## Codex
 
@@ -24,7 +33,9 @@ command = "C:/path/to/threadsatchel/.venv/Scripts/python.exe"
 args = ["C:/path/to/threadsatchel/server_readonly.py"]
 ```
 
-Reconnect/restart the client as needed and check that search_memory and get_memory are available. Ask: "Search ThreadSatchel for sample archive, then retrieve the matching record."
+Reconnect/restart the client as needed and check that all four tools above are available. Ask: "Search ThreadSatchel for sample archive, then retrieve the matching record."
+
+Reconnect after updating the server files. If you enable AI and `prewarm_enabled` after the MCP process was started with either switch off, reconnect once more to start its cache warmer. A running warmer reads later switch changes dynamically; prewarming prepares existing data in RAM without contacting a model.
 
 Official configuration reference: https://developers.openai.com/codex/mcp
 

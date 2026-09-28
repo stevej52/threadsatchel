@@ -1,6 +1,10 @@
 # Optional local AI memory
 
+For a first installation, follow the [Qwen setup guide](QWEN_INSTALL.md): branch selection, dependencies, pinned downloads/checksums, model startup, configuration, and a synthetic verification. This page explains behavior, limits, and recovery after setup.
+
 ThreadSatchel's ordinary imports, capture, SQLite FTS search, and original-record retrieval work without a model. This optional feature is **off by default**. Enable it only in your local configuration. Installing this branch or starting the read-only MCP server does not opt you in.
+
+Qwen's weights were not modified or fine-tuned. ThreadSatchel adds integration and validation code around a local chat model plus a separate CPU embedding model. NumPy is an optional ranking accelerator; there is no separate reranker model. Installation-specific robot/network controls on the reference computer are not part of this public feature.
 
 The feature builds a second, disposable index from your existing archive. `memory.sqlite3` remains the source of truth: model output does not rewrite its messages, revisions, provenance, or full-text index. Derived summaries, questions, keywords, facts, and vectors live in `.ai-cache/index.sqlite3`. They can be rebuilt from the original records.
 
@@ -38,14 +42,14 @@ Run commands from your ThreadSatchel checkout:
 ```sh
 python memory_ai.py status
 python memory_ai.py on
-python memory_ai.py process
-python memory_ai.py brief "Example project"
-python memory_ai.py off
+python memory_ai.py embeddings
 ```
+
+Start the separately managed chat server first. The final command above remains running to own the CPU embedding service; leave it in its own terminal. Then use another terminal for `python memory_ai.py process` and `python memory_ai.py brief "Example project"`. Neither processing nor interactive searches launch a missing embedding service. Use `python memory_ai.py off` to disable new optional work. See the [complete startup order](QWEN_INSTALL.md#4-enable-and-test-in-the-right-order).
 
 Enabling is a local choice, not a repository default. The settings live in `memory-ai.json`, which is excluded from Git. `off` disables subsequent AI work; an already running chunk may finish. It preserves original memories and the disposable cache. Use `status` to inspect whether the feature is enabled, processing counts, and the latest pass report before relying on derived results. `process` performs a bounded pass; repeat it to continue indexing.
 
-Reconnect an already-running MCP client after installing this branch so it loads the updated server and discovers `get_project_brief` and `memory_ai_status`. Subsequent on/off changes are read dynamically. With scheduling installed, re-enabling starts background work at the next scheduled pass, within five minutes.
+Reconnect an already-running MCP client after installing this branch so it loads the updated server and discovers `get_project_brief` and `memory_ai_status`. Subsequent on/off changes are read dynamically. If AI or prewarming was off when the MCP process started, reconnect after enabling prewarming so its warmer is created. With scheduling installed and the Windows user logged in, re-enabling allows background work at the next scheduled pass; the chat server must still be running independently.
 
 Configure project terms in your local `memory-ai.json`. For example, these fields select two synthetic projects and leave other records out of optional processing:
 
@@ -67,15 +71,15 @@ To start the configured CPU embedding service manually, run `python memory_ai.py
 
 To change embedding model paths or worker settings, disable AI, allow the current owner to exit, edit the configuration, then enable AI and start the owner again. The running owner keeps its startup configuration.
 
-Background processing is optional. It runs bounded passes at idle priority so foreground work takes precedence. The processor checks that the chat service is idle before starting inference; a request already in flight is allowed to finish. It does not stop or restart the chat service used by another application.
+Background processing is optional. Installed Windows tasks run bounded passes at idle priority; the embedding owner/child also request lower priority. Manual `process` does not itself lower priority. The processor checks that the chat service is idle before starting inference, but `/slots` is advisory rather than a reservation. Another application can become active afterward, and a request already in flight is allowed to finish. The processor does not stop or restart the chat service used by another application.
 
 Passes alternate between configured projects so a stream of recent messages in one project does not take every analysis slot. Work within each project is ordered newest first. Embedding failures record attempts and a retry delay; a persistently failing chunk is held rather than consuming every pass indefinitely. Whitespace-only chunks are omitted. Source indexing checks its work allowance between chunks and resumes large records in a later pass. Chat HTTP requests have an overall deadline as well as a response-size limit. Initial indexing is incremental; inspect coverage rather than assuming the whole archive has been processed.
 
-After a manual bounded pass succeeds, Windows users can opt into the schedule with `python memory_ai.py install-schedule`. This installs ordinary user tasks for processing and the embedding service owner every five minutes, with overlapping runs suppressed. Existing tasks are not silently replaced. Disabling AI is sufficient to prevent new scheduled passes from calling a model. Other systems can invoke the same commands through their user scheduler.
+After a manual bounded pass succeeds, Windows users can opt into the schedule with `python memory_ai.py install-schedule`. This installs limited, interactive user tasks for processing and the embedding service owner, with logon triggers and five-minute repetition, overlapping runs suppressed. Your account must remain logged in. Existing tasks are not silently replaced, and the installer does not manage chat-server startup. Disabling AI is sufficient to prevent new scheduled passes from calling a model. Other systems can invoke the manual commands through their own scheduler; the AI schedule installer and native resource counters currently support Windows only.
 
 ## Optional idle CPU and RAM use
 
-The following features are opt-in and require no additional model, paid API, database,
+The following features are opt-in and require no additional model, paid API, database beyond the existing derived index,
 Windows service, or scheduled task. They reuse the existing embedding owner and MCP
 processes. The example configuration leaves all three switches off; set
 `idle_embeddings`, `prewarm_enabled`, and `health_checks_enabled` to `true` to enable
@@ -98,19 +102,20 @@ Back up your runtime configuration before editing it.
   samples of source hashes, original retained bytes, source quotations, vectors,
   and one discovered SQLite backup. It records missing/stale AI coverage separately
   from corruption. It never repairs, merges, deletes, or reimports source memory.
-- **Prepared project context:** the warmer prepares owner-configured project briefs
-  and the general brief, up to eight projects. The existing `get_project_brief`
+- **Prepared project context:** the warmer prepares up to eight configured project briefs.
+  The general brief is appended when `include_unassigned` is true and counts toward
+  that same limit. The existing `get_project_brief`
   tool serves these bounded, source-validated RAM copies. It preserves partial
   coverage, conflicting evidence, and uncertainty; it does not invent a current
   decision or run extra Qwen generation. Brief storage is capped at 32 entries of
   at most 256 KiB each. The ordinary Qwen task continues building their contents.
 
-Background work starts only when measured whole-machine CPU is at most 25% and
+These extra idle-indexing, prewarming, and automatic-health passes start only when measured whole-machine CPU is at most 25% and
 at least 8 GiB of physical RAM is available. Extra indexing checks again between
 chunks. Native resource counters currently support Windows; unavailable counters
 defer optional background work. Manual retrieval and manual health checks remain
 usable. Limits are configurable within validated bounds; they are safety margins,
-not claims of optimal performance. A model request already in flight may finish
+not claims of optimal performance. They do not gate every ordinary manual or scheduled analysis pass. Automatic health checks require the embedding owner, hence both `enabled` and `embeddings` must be true. RAM caches belong to each persistent MCP process; limits are not a single shared allocation. A model request already in flight may finish
 after a switch or budget changes (idle embedding requests are capped at five
 seconds). A single OS/storage call may also exceed a soft deadline.
 
@@ -186,7 +191,7 @@ This selected, queued retry limits output to one fact and supplies at most eight
 
 If chat weights change behind an unchanged model alias, change `chat_model_revision` too; operational batch or timeout tuning does not require reanalysis. An optional `chat_api_key_file` may point to an absolute protected local secret file when the chat server requires authentication. Keep that file out of the repository; its contents are not included in analysis identities or error messages.
 
-The cache is rebuildable. Stop optional processing before removing `.ai-cache/index.sqlite3`, then run `process` again with AI enabled. Do not delete `memory.sqlite3`, imported objects, or backups when clearing derived data.
+The cache is rebuildable. Before replacing derived data, disable AI, let processing stop, and stop all MCP processes that have the cache open. Preserve the entire `.ai-cache` directory as a backup rather than deleting one SQLite file while its WAL may still exist. After restoring the local services and enabling AI, processing can rebuild a missing derived index. Do not delete `memory.sqlite3`, imported objects, or archive backups when clearing derived data.
 
 ## Synthetic evaluation
 
