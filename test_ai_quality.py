@@ -198,6 +198,7 @@ class OptionalAIIntegrationTests(unittest.TestCase):
         self.archive_digest = hashlib.sha256(self.db_path.read_bytes()).hexdigest()
 
     def tearDown(self):
+        ai_memory.close_cached_readers(self.root)
         self.temp.cleanup()
 
     def write_config(self):

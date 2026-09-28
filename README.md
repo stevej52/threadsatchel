@@ -15,7 +15,7 @@ A small, local memory archive that AI assistants can search through MCP. Keep or
 - Can queue capture on several machines and pull it into one archive over existing SSH connections.
 - Makes repeated imports safe and conservatively reconciles overlapping excerpts.
 - Optionally imports completed inbox files every two minutes using the same importer.
-- Returns compact search excerpts, with full originals available by ID or `full=True`.
+- Returns compact search excerpts, with full originals available by ID or `full=True` on the same ranked search results.
 - Optionally adds local Qwen semantic search, evidence-linked interpretations and cached project briefings. This feature is off unless you enable it; the normal installation needs no model or special hardware.
 
 ## Start here
@@ -75,6 +75,6 @@ This does **not** automatically capture ChatGPT's website or phone app, every Cl
 
 ## Development
 
-Run `python scripts/check.py` for isolated tests. See [architecture](docs/ARCHITECTURE.md) for the modules and data flow. No embeddings, vector database, paid API key, or model inference are required by this software. Your AI client's normal usage still applies when it retrieves and reads memories.
+Run `python scripts/check.py` for isolated tests, including bounded inputs, retry/concurrency safety, and optional AI cache/retrieval regressions. See [architecture](docs/ARCHITECTURE.md) for the modules and data flow. No embeddings, vector database, paid API key, or model inference are required by this software. Your AI client's normal usage still applies when it retrieves and reads memories.
 
 MIT licensed. Independent project; not affiliated with OpenAI or Anthropic.

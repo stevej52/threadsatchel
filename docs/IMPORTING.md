@@ -10,6 +10,16 @@ python import_memory.py /path/to/export.zip
 
 The database must already exist (setup_memory.py). The importer keeps original input bytes, records import receipts, and commits records plus search entries transactionally. Renamed identical files are safe to repeat. Failed imports return exit code 1; keep the original file for diagnosis.
 
+Ordinary manual imports are limited to 32 MiB of input. ZIP inputs allow at most 10,000 entries and 128 MiB of expanded `conversations.json`; attachments are never extracted or executed. Limits apply before reading the entire input or expanding the selected ZIP member. The automatic inbox sweep keeps its stricter 8 MiB limit and does not accept ZIP files.
+
+For a reviewed larger official export, first preserve the original and back up the archive, then make the allowance explicit. For example:
+
+```sh
+python import_memory.py /path/to/export.zip --max-file-mib 256 --max-expanded-mib 512 --max-zip-members 20000
+```
+
+The manual allowance has hard ceilings of 1 GiB for input/expansion and 100,000 ZIP entries. Raising it does not validate an unfamiliar export schema; test the actual export on an archive copy first. Oversized or invalid inputs fail without advancing receipts or deleting the source.
+
 A threadsatchel/1 packet has kind excerpt, summary, or note, an optional title/account_id/conversation_id, and a messages list. Each message has text and optional speaker, message_id, source_order, source_date, and source_url. examples/example-excerpt.json is synthetic.
 
 Omit IDs, dates, and source order you do not know. Never substitute local array positions for real source order. Keep message text exact. Label summaries separately. Split edits with the same message ID into separate packets.
@@ -31,7 +41,7 @@ For anonymous-to-export reconciliation, the excerpt must contain at least two me
 
 The importer reports added_revisions, reused_messages, repeated_packets, linked_entities, uncertain, warnings, and (when reconciliation runs) ambiguous_excerpt_packets. Review warnings and ambiguous cases; do not interpret them as fully resolved coverage.
 
-Deduplication reduces duplicate searchable records. It does not delete original source archives: raw inputs, provenance, and revisions consume space intentionally. This is not a storage compactor. store_memory on the optional writable MCP endpoint is append-only and bypasses these importer protections.
+Deduplication reduces duplicate searchable records. It does not delete original source archives: raw inputs, provenance, and revisions consume space intentionally. This is not a storage compactor. `store_memory` on the optional writable MCP endpoint does not perform conversation reconciliation. Its optional caller-generated `idempotency_key` makes retries of that exact write safe; without a key it remains append-only. See [the writable tool contract](CONNECTING.md).
 
 ## OpenAI ZIP status
 

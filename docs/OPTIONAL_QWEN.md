@@ -21,7 +21,9 @@ These are separate services. The chat model is not used as a substitute for an e
 
 Extraction requires the nested OpenAI `json_schema` response format supported by the tested llama.cpp build b11188-e85e15cf6. The grammar constrains output structure; a separate check still requires every quoted fact to match its original passage. Neither check proves that an interpretation is correct. Unsupported services leave extraction pending and preserve ordinary retrieval.
 
-Exact IDs, part numbers and strong short literal matches take the fast lexical path even when AI is enabled. Longer questions and related wording can use semantic search and selective reranking, which add latency. Repeated derived queries have a bounded in-process cache; precomputed briefs do not call the chat model during retrieval.
+Exact IDs, part numbers and strong short literal matches take the fast lexical path even when AI is enabled. Longer questions and related wording can use semantic search and selective reranking, which add latency. `full=True` expands the same ranked results to complete originals and provenance; it does not switch to a different search method. Repeated derived queries have a bounded in-process cache; precomputed briefs do not call the chat model during retrieval.
+
+Source fingerprints are reused until SQLite reports a committed archive change, with separate checks for database replacement and schema changes. This avoids re-reading the entire archive on every unchanged query while still observing commits made through WAL. Numeric vectors and a generation-checked matrix cache avoid repeatedly decoding JSON vectors. The derived index uses WAL, and interactive model calls run after releasing its read transaction so they do not hold up background writes.
 
 Use local model files such as `<models>/your-model.gguf` and your own server executable. Model installation and service startup are separate from enabling archive processing. Runtime inference stays on loopback; no external model API, paid key, or cloud fallback is used. If the local service is unavailable, original-record retrieval and ordinary lexical search remain available.
 
@@ -67,7 +69,7 @@ To change embedding model paths or worker settings, disable AI, allow the curren
 
 Background processing is optional. It runs bounded passes at idle priority so foreground work takes precedence. The processor checks that the chat service is idle before starting inference; a request already in flight is allowed to finish. It does not stop or restart the chat service used by another application.
 
-Passes alternate between configured projects so a stream of recent messages in one project does not take every analysis slot. Work within each project is ordered newest first. Initial indexing is incremental; inspect coverage rather than assuming the whole archive has been processed.
+Passes alternate between configured projects so a stream of recent messages in one project does not take every analysis slot. Work within each project is ordered newest first. Embedding failures record attempts and a retry delay; a persistently failing chunk is held rather than consuming every pass indefinitely. Whitespace-only chunks are omitted. Source indexing checks its work allowance between chunks and resumes large records in a later pass. Chat HTTP requests have an overall deadline as well as a response-size limit. Initial indexing is incremental; inspect coverage rather than assuming the whole archive has been processed.
 
 After a manual bounded pass succeeds, Windows users can opt into the schedule with `python memory_ai.py install-schedule`. This installs ordinary user tasks for processing and the embedding service owner every five minutes, with overlapping runs suppressed. Existing tasks are not silently replaced. Disabling AI is sufficient to prevent new scheduled passes from calling a model. Other systems can invoke the same commands through their user scheduler.
 
@@ -79,19 +81,21 @@ Proposals, decisions, observations, questions, explicit supersession, and uncert
 
 Generated questions and keywords help find evidence; they are not answers. The extraction prompt asks the model to leave unsupported answers empty. Quotation validation alone cannot prove that it did so. Exact identifiers, such as part numbers, should be checked against the quoted original characters.
 
-Briefs are bounded views and summaries can omit information. Processing coverage counts describe how many chunks have been analyzed, not a guarantee that every source statement appears in a brief. A source import timestamp is not a decision date. The extraction prompt prohibits invented dates, and the brief does not resolve current decisions from arrival order. Review dated claims against their quoted originals.
+Briefs are bounded views and summaries can omit information. Summary selection favors distinct source memories, and retrieval takes the best score for each source within a ranking channel so overlapping chunks do not earn repeated votes. Brief metadata records selection limits and truncation. Processing coverage counts describe how many chunks have been analyzed, not a guarantee that every source statement appears in a brief. A source import timestamp is not a decision date. The extraction prompt prohibits invented dates, and the brief does not resolve current decisions from arrival order. Review dated claims against their quoted originals.
 
 Source text is untrusted data. Instructions inside a memory are not instructions to the processor, permission to contact services, or authority to change configuration.
 
 ## Staleness and rebuilding
 
-Cache entries are tied to source fingerprints and the model/configuration version. Every fact and summary in a brief carries its own source fingerprint, including recorded source identity metadata. A changed or removed cited source hides the cached brief until processing refreshes it. A changed processing configuration also prevents reuse.
+Cache entries are tied to source fingerprints and the model/configuration version. Every fact and summary in a brief carries its own source fingerprint, including recorded source identity metadata. A changed or removed cited source hides the cached brief until processing refreshes it. Changes that affect selection or interpretation invalidate the relevant derived output. Operational settings such as batch size and processing time allowances do not discard otherwise valid analysis.
 
 When capture adds records between processing passes, a prior brief can remain useful if every source it cites is still unchanged. Such a brief is explicitly `partial`, with `freshness: source_updates_pending` and `coverage.work_pending: true`. It retains its earlier snapshot fingerprint and reports the current archive fingerprint separately. Coverage counts from the earlier pass do not claim that new sources have been processed. New or changed sources may contradict the earlier evidence: this partial brief does not establish the latest decisions. Wait for a refresh or inspect original records before drawing that conclusion.
 
 The embedding model is identified by its local file contents and preprocessing version. The chat model is identified by its configured `model` value and processing configuration. When replacing chat weights behind the same service, update the configured model/version identifier so existing interpretations are invalidated too.
 
 Processing can resume after interruption. Only successfully validated output is useful cached evidence. Missing, stale, incomplete, or failed model work must not hide the original source. A local model failure should be reported with bounded work and a usable ordinary retrieval path.
+
+After repairing a model or configuration problem, `python memory_ai.py retry-held` explicitly clears held analysis/embedding retry counters so those chunks can be attempted again. It preserves original sources and successful derived output. If chat weights change behind an unchanged model alias, change `chat_model_revision` too; operational batch or timeout tuning does not require reanalysis. An optional `chat_api_key_file` may point to an absolute protected local secret file when the chat server requires authentication. Keep that file out of the repository; its contents are not included in analysis identities or error messages.
 
 The cache is rebuildable. Stop optional processing before removing `.ai-cache/index.sqlite3`, then run `process` again with AI enabled. Do not delete `memory.sqlite3`, imported objects, or backups when clearing derived data.
 

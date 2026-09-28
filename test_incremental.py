@@ -146,8 +146,12 @@ async def run():
             assert sorted(t.name for t in (await client.list_tools()).tools)==['get_memory','get_project_brief','memory_ai_status','search_memory','store_memory']
             stored=await tool(client,'store_memory',text='SYNTHETIC writabletool',source='SYNTHETIC TEST')
             assert (await tool(client,'get_memory',id=stored['id']))==stored
+            keyed=await tool(client,'store_memory',text='SYNTHETIC keyedretry',source='SYNTHETIC TEST',idempotency_key='synthetic-client:write-1')
+            replay=await tool(client,'store_memory',text='SYNTHETIC keyedretry',source='SYNTHETIC TEST',idempotency_key='synthetic-client:write-1')
+            assert replay==keyed
+            assert len(await tool(client,'search_memory',query='keyedretry'))==1
             assert len(await tool(client,'search_memory',query='amberquartz'))==4
-        passed.append('Existing writable MCP tools and store contract preserved')
+        passed.append('Existing writable MCP tools and store contract preserved; explicit keyed retries return one searchable record')
     report=dict(status='PASS',tests=passed,fixtures='Clearly labeled synthetic data; isolated temporary database removed',actual_export_validation='PENDING: real ChatGPT ZIP not available')
     (ROOT/'incremental-test-results.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
     print(json.dumps(report,indent=2))

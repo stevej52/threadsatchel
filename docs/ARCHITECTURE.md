@@ -14,7 +14,7 @@ Entities identify sources; revisions identify versions of their text. Canonical 
 
 ## Capture path
 
-codex_capture.py is the original local collector; codex_capture_export.py extends it with export-only mode and is the recommended configurable entry point. Both use recorded source session/message IDs, byte offsets, header/edge hashes, a lock, atomic state replacement and deterministic packet hashes. Rewrites/truncation reset a source cursor; retries reuse source identity at import.
+codex_capture.py is the original local collector; codex_capture_export.py extends it with export-only mode and is the recommended configurable entry point. Both share bounded JSONL reads and fair file iteration through capture_read.py. They use recorded source session/message IDs, byte offsets, header/edge hashes, a lock, atomic state replacement and deterministic packet hashes. Rewrites/truncation reset a source cursor; retries reuse source identity at import. A held event never advances the import checkpoint, while a separate scan cursor allows other sessions to proceed.
 
 capture_transport.py lists queued filtered packets and acknowledges validated hashes. sync_codex_capture.py runs configured SSH commands, verifies incoming hashes, preserves received packets centrally and calls the importer. Source acknowledgement occurs only after successful commits. It does not need database write access on source machines.
 

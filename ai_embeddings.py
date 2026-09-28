@@ -7,6 +7,7 @@ The embedding endpoint is deliberately separate from the robot's chat service.
 from __future__ import annotations
 
 import atexit
+from array import array
 import hashlib
 import heapq
 import http.client
@@ -15,6 +16,9 @@ from itertools import chain
 import json
 import math
 import os
+import socket
+import struct
+import sys
 from pathlib import Path
 import stat
 import subprocess
@@ -203,6 +207,134 @@ def cosine_top_k(query_vector, rows, k=20):
         elif item[:2] > best[0][:2]:
             heapq.heapreplace(best, item)
     return [(identifier, score) for score, _, identifier in sorted(best, reverse=True)]
+
+
+def pack_vector(vector):
+    """Versioned little-endian float32 storage; never deserialize executable data."""
+    values = normalize_vector(vector)
+    return b'TSV1' + struct.pack('<' + 'f' * len(values), *values)
+
+
+def unpack_vector(value):
+    if isinstance(value, str):  # Old caches remain readable and migrate in bounded passes.
+        return normalize_vector(json.loads(value))
+    if not isinstance(value, bytes) or value[:4] != b'TSV1' or (len(value)-4) % 4:
+        raise EmbeddingError('Invalid stored embedding')
+    count = (len(value)-4)//4
+    if not 1 <= count <= MAX_VECTOR_DIMENSIONS:
+        raise EmbeddingError('Invalid stored embedding dimensions')
+    return normalize_vector(struct.unpack('<' + 'f'*count, value[4:]))
+
+
+class VectorIndex:
+    """Immutable, validated derived matrix, reusable until its SQLite generation changes."""
+    def __init__(self, rows):
+        identifiers, values = [], array('f')
+        dimensions = None
+        self.numpy = _optional_numpy()
+        for identifier, stored in rows:
+            if self.numpy is not None and isinstance(stored,bytes):
+                if stored[:4]!=b'TSV1' or (len(stored)-4)%4 or not 1<=(len(stored)-4)//4<=MAX_VECTOR_DIMENSIONS:
+                    raise EmbeddingError('Invalid stored embedding')
+                vector=array('f');vector.frombytes(stored[4:])
+                if sys.byteorder!='little':vector.byteswap()
+            else:
+                vector = unpack_vector(stored)
+            if dimensions is not None and len(vector) != dimensions:
+                raise EmbeddingError('Inconsistent stored embedding dimensions')
+            dimensions = len(vector)
+            identifiers.append(identifier)
+            values.extend(vector)
+            if len(values)*values.itemsize > 128*1024*1024:
+                raise EmbeddingError('Derived vector matrix exceeds the 128 MiB budget')
+        self.identifiers = tuple(identifiers)
+        if identifiers and self.numpy is not None:
+            self.vectors = self.numpy.frombuffer(values, dtype=self.numpy.float32).reshape(len(identifiers),dimensions)
+            if not self.numpy.isfinite(self.vectors).all():
+                raise EmbeddingError('Invalid stored embedding numbers')
+            norms=self.numpy.sqrt(self.numpy.einsum('ij,ij->i',self.vectors,self.vectors,optimize=False))
+            if self.numpy.any(norms==0) or not self.numpy.isfinite(norms).all():
+                raise EmbeddingError('Invalid stored embedding norm')
+            self.vectors/=norms[:,None]
+            self.vectors.flags.writeable = False
+        else:
+            self.vectors = values
+        self.dimensions = dimensions
+
+    def top_k(self, query_vector, k=20, groups=None, allowed=None):
+        query = normalize_vector(query_vector)
+        if not self.identifiers:
+            return []
+        if len(query) != self.dimensions:
+            raise EmbeddingError('Invalid query embedding dimensions')
+        if self.numpy is not None:
+            scores = self.numpy.einsum('ij,j->i', self.vectors,
+                self.numpy.asarray(query, dtype=self.numpy.float32), optimize=False)
+        else:
+            scores = (math.fsum(a*b for a,b in zip(query,self.vectors[start:start+self.dimensions]))
+                      for start in range(0,len(self.vectors),self.dimensions))
+        # Keep the best passage per memory before the bounded result selection.
+        best = {}
+        for position, (identifier, score) in enumerate(zip(self.identifiers, scores)):
+            if allowed is not None and identifier not in allowed:
+                continue
+            key = groups.get(identifier, identifier) if groups is not None else identifier
+            item = (max(-1.0, min(1.0, float(score))), -position, identifier)
+            if key not in best or item[:2] > best[key][:2]:
+                best[key] = item
+        return [(identifier, score) for score, _, identifier in heapq.nlargest(k, best.values())]
+
+
+def bounded_json_request(host, port, method, route, body, timeout, max_bytes, authorization=None):
+    """One wall-clock deadline, including slow headers and trickled response bodies."""
+    deadline = time.monotonic() + max(0.001, timeout)
+    conn = http.client.HTTPConnection(host, port, timeout=max(0.001, timeout))
+    sock = None
+    timer = None
+    try:
+        conn.connect()
+        sock = conn.sock
+        def expire():
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        timer = threading.Timer(max(0.001, deadline-time.monotonic()), expire)
+        timer.daemon = True
+        timer.start()
+        headers={'Content-Type':'application/json', 'Accept':'application/json', 'Connection':'close'}
+        if authorization is not None:
+            headers['Authorization']='Bearer '+authorization
+        conn.request(method, route, body=body,headers=headers)
+        response = conn.getresponse()
+        if response.status != 200:
+            raise EmbeddingError('Local endpoint returned HTTP ' + str(response.status))
+        if response.getheader('Content-Encoding', 'identity') != 'identity':
+            raise EmbeddingError('Encoded local responses are prohibited')
+        length = response.getheader('Content-Length')
+        if length is not None and not 0 <= int(length) <= max_bytes:
+            raise EmbeddingError('Local response exceeds byte budget')
+        pieces, received = [], 0
+        while not response.isclosed():
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('Local request deadline exceeded')
+            sock.settimeout(remaining)
+            piece = response.read1(min(65536, max_bytes+1-received))
+            if not piece:
+                break
+            pieces.append(piece)
+            received += len(piece)
+            if received > max_bytes:
+                raise EmbeddingError('Local response exceeds byte budget')
+        if time.monotonic() >= deadline:
+            raise TimeoutError('Local request deadline exceeded')
+        return json.loads(b''.join(pieces),
+            parse_constant=lambda _: (_ for _ in ()).throw(ValueError('Nonfinite JSON')))
+    finally:
+        if timer is not None:
+            timer.cancel()
+        conn.close()
 
 
 class _WindowsJob:

@@ -1,5 +1,6 @@
 """One bounded inbox pass; storage and reconciliation belong to import_memory."""
 import argparse
+from bisect import bisect_right
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 import hashlib
@@ -62,11 +63,29 @@ def read_guard(path):
         yield stream, info
 
 
-def has_receipt(db_path, sha, path):
+def has_receipt(db_path, sha, path, connection=None):
+    if connection is not None:
+        return connection.execute('SELECT 1 FROM import_receipts WHERE object_sha=? AND path=?',
+                                  (sha, str(path))).fetchone() is not None
     with closing(sqlite3.connect(db_path.as_uri() + '?mode=ro', uri=True, timeout=10)) as db:
         db.execute('PRAGMA query_only=ON')
-        return db.execute('SELECT 1 FROM import_receipts WHERE object_sha=? AND path=?',
-                          (sha, str(path))).fetchone() is not None
+        return has_receipt(db_path, sha, path, db)
+
+
+def contains_possible_credential(value):
+    """Defense in depth only: inspect decoded packet strings, never log matches."""
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            if SECRET.search(item):
+                return True
+        elif isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
+    return False
 
 
 def backup_before_import(root):
@@ -112,21 +131,29 @@ def _sweep(root, inbox, db_path, runtime, settle_seconds, retry_failed):
     logger.propagate = False
     logger.addHandler(handler)
     started = time.monotonic()
+    receipt_db = None
     try:
-        for path in sorted(inbox.iterdir()):
+        receipt_db = sqlite3.connect(db_path.as_uri() + '?mode=ro', uri=True, timeout=10)
+        receipt_db.execute('PRAGMA query_only=ON')
+        paths = sorted(inbox.iterdir(), key=lambda path: path.name)
+        # Resume strictly after the last examined name, wrapping once. A removed
+        # cursor file is harmless; newly inserted earlier names get the next turn.
+        offset = bisect_right([path.name for path in paths], state.get('cursor', ''))
+        for path in paths[offset:] + paths[:offset]:
             if (runtime / 'disabled.flag').exists():
                 report['state'] = 'disabled'
                 break
             if time.monotonic() - started > 60 or report['imported_files'] >= MAX_IMPORTS:
                 report['state'] = 'more_pending'
                 break
-            info = path.lstat()
-            if (not stat.S_ISREG(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400
-                    or path.is_symlink() or is_temporary_file(path) or path.suffix.lower() not in FORMATS):
-                report['ignored_files'] += 1
-                continue
+            state['cursor'] = path.name
             item = {'file': path.name, 'checked_at': timestamp()}
             try:
+                info = path.lstat()
+                if (not stat.S_ISREG(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400
+                        or path.is_symlink() or is_temporary_file(path) or path.suffix.lower() not in FORMATS):
+                    report['ignored_files'] += 1
+                    continue
                 with read_guard(path) as (stream, info):
                     if time.time() - info.st_mtime < settle_seconds:
                         report['deferred_files'] += 1
@@ -140,23 +167,23 @@ def _sweep(root, inbox, db_path, runtime, settle_seconds, retry_failed):
                         sha = hashlib.sha256(raw).hexdigest()
                         item['sha256'] = sha
                         previous = entries.get(path.name, {})
-                        if has_receipt(db_path, sha, path):
+                        if has_receipt(db_path, sha, path, receipt_db):
                             item.update(status='already_present')
                             report['already_present'] += 1
                         elif (previous.get('sha256') == sha and previous.get('status') in ('held', 'importing')
                               and not previous.get('retryable', False) and not retry_failed):
                             item.update(status='held', error=previous.get('error', 'interrupted_import_check_before_retry'))
                         else:
-                            parse(path, raw, {})  # use the existing schema validator before any DB writes
-                            if SECRET.search(raw.decode('utf-8-sig')):
+                            packets, _ = parse(path, raw, {})  # validate before any DB writes
+                            if SECRET.search(raw.decode('utf-8-sig')) or contains_possible_credential(packets):
                                 item.update(status='held', error='possible_credential_review_required')
                             else:
                                 if report['backup'] is None:
                                     report['backup'] = backup_before_import(root)
                                 entries[path.name] = dict(item, status='importing')
                                 dump_atomic(state_path, state)
-                                result = import_file(path, db_path)
-                                if result['sha256'] != sha or not has_receipt(db_path, sha, path):
+                                result = import_file(path, db_path, max_file_bytes=MAX_BYTES, expected_sha256=sha)
+                                if result['sha256'] != sha or not has_receipt(db_path, sha, path, receipt_db):
                                     raise RuntimeError('commit_verification_failed')
                                 item.update(status='imported', **{key: result[key] for key in
                                     ('added_revisions', 'reused_messages', 'linked_entities', 'repeated_packets')})
@@ -186,7 +213,10 @@ def _sweep(root, inbox, db_path, runtime, settle_seconds, retry_failed):
                 logger.info(json.dumps(item, ensure_ascii=True))
             entries[path.name] = item
             report['files'].append(item)
-            dump_atomic(state_path, state)
+        # Importing checkpoints above remain durable before each DB write. Other
+        # receipts/check times and the fair continuation cursor need only one
+        # atomic write per completed/budget-limited pass.
+        dump_atomic(state_path, state)
         if report['state'] == 'running':
             report['state'] = 'attention_required' if report['held_files'] else 'ok'
         report['finished_at'] = timestamp()
@@ -194,6 +224,8 @@ def _sweep(root, inbox, db_path, runtime, settle_seconds, retry_failed):
         logger.info(json.dumps({k: v for k, v in report.items() if k != 'files'}))
         return report
     finally:
+        if receipt_db is not None:
+            receipt_db.close()
         logger.removeHandler(handler)
         handler.close()
 

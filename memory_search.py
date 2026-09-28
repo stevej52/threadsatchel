@@ -103,7 +103,7 @@ def lexical_search(db, query, limit=20):
 
 
 def search(db, root, query, limit=20, full=False):
-    """Compact default; full=True preserves original bodies and complete provenance."""
+    """Rank once; full=True expands the same IDs to original bodies and provenance."""
     limit = validate_limit(limit)
     if not isinstance(full, bool):
         raise ValueError('full must be a boolean')
@@ -117,28 +117,31 @@ def search(db, root, query, limit=20, full=False):
         hits = lexical_search(db, query, limit)
         if not expressions and not hits:
             return []
-        if full:
-            if not hits:
-                return []
-            ids = [hit['id'] for hit in hits]
-            records = {row['id']: row for row in db.execute(
-                'SELECT * FROM memories WHERE id IN (' + ','.join('?' for _ in ids) + ')', ids)}
-            return enrich_many(db, [records[memory_id] for memory_id in ids])
         hits = compact_source_ids(db, hits)
         # Config is read by the optional module on every call, so stdio workers see toggles.
         try:
             from ai_memory import enhance_search
         except ImportError:
-            return hits
+            enhance_search = None
         try:
-            enhanced = enhance_search(Path(root), db, query, hits, limit,
-                                      release_snapshot=owns_snapshot)
-            if not isinstance(enhanced, list) or not all(isinstance(hit, dict) for hit in enhanced):
-                return hits
-            return enhanced[:limit]
+            if enhance_search is None:
+                enhanced = hits
+            else:
+                enhanced = enhance_search(Path(root), db, query, hits, limit,
+                                          release_snapshot=owns_snapshot)
+            if isinstance(enhanced, list) and all(isinstance(hit, dict) and 'id' in hit for hit in enhanced):
+                hits = enhanced[:limit]
         except Exception:
             # A model/service failure must never take the authoritative lexical path down.
-            return hits
+            pass
+        if full and hits:
+            if owns_snapshot and not db.in_transaction:
+                db.execute('BEGIN')
+            ids = list(dict.fromkeys(hit['id'] for hit in hits))
+            records = {row['id']: row for row in db.execute(
+                'SELECT * FROM memories WHERE id IN (' + ','.join('?' for _ in ids) + ')', ids)}
+            return enrich_many(db, [records[mid] for mid in ids if mid in records])
+        return hits
     finally:
         if owns_snapshot and db.in_transaction:
             db.rollback()

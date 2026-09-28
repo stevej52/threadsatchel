@@ -85,7 +85,8 @@ class Tests(unittest.TestCase):
         with patch.object(cap, 'import_file', side_effect=RuntimeError('SYNTHETIC import failure')):
             result = cap.run(self.cfg)
         self.assertEqual(len(result['errors']), 1)
-        self.assertFalse((self.root/'capture'/'state.json').exists())
+        state = json.loads((self.root/'capture'/'state.json').read_text(encoding='utf-8'))
+        self.assertEqual(state['sessions'], {})
         self.assertEqual(self.run_capture()['counts']['added_revisions'], 1)
 
     def test_background_excluded(self):

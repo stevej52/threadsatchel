@@ -23,7 +23,7 @@ def connect():
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
 def search_memory(query: str, limit: int = 20, full: bool = False) -> list[dict]:
-    """Search compact matching excerpts (limit 1..20); full=True returns exact text and provenance."""
+    """Search ranked excerpts (limit 1..20); full=True expands the same search results to original text and provenance."""
     with closing(connect()) as db:
         return search(db, Path(DB).parent, query, limit=limit, full=full)
 

@@ -10,7 +10,9 @@ Default local import/search/capture uses SQLite and Python; it makes no model/AP
 
 Imports preserve original input bytes, including a whole supplied ZIP, plus parsed searchable text, provenance, and revisions. The optional AI cache contains additional plaintext excerpts, vectors and generated interpretations; it is private disposable data, excluded from Git. Credential filtering applies to the Codex capture projector, not general manual imports. An export can include sensitive material in its retained original even when the parser does not index it. Review what you import.
 
-The database, raw imported objects, queues, and backups are plaintext. Protect them with appropriate filesystem access and disk encryption. SSH protects transport, not data at rest. This project has no built-in authentication, encryption, retention policy, deletion UI, or automatic backup schedule.
+The database, raw imported objects, queues, and backups are plaintext. Protect them with appropriate filesystem access and disk encryption. Limit the archive, program code, configuration, and backups to their owner and required administrator/service accounts. On Windows, inherited access for broad groups such as `Users` or `Authenticated Users` can otherwise let unrelated local accounts read private memories or replace code. Preserve existing ACLs before changing them and verify access for intended capture/import processes afterward. SSH protects transport, not data at rest. This project has no built-in authentication, encryption, retention policy, deletion UI, or automatic backup schedule.
+
+The AI client's loopback URL does not prove that an independently managed model server is private. Verify the server's listening address and the host firewall separately. A model service needed only on this computer should bind to loopback; if another device legitimately needs it, require an authenticated, deliberately restricted connection. The optional embedding worker binds its owned service to loopback and does not reconfigure another application's chat server.
 
 ## Read-only is separate from writable
 

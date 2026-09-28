@@ -9,10 +9,20 @@ import shutil
 import subprocess
 import sys
 import time
-from ai_memory import archive_connect, load_config, process, project_brief, status
+from ai_memory import archive_connect, cache_connect, load_config, process, project_brief, status
 from codex_capture import capture_lock, dump_atomic
 
 ROOT=Path(__file__).resolve().parent
+
+
+def retry_held(root):
+    """Explicit owner retry after repairing an unavailable model or invalid configuration."""
+    runtime=Path(root)/'.ai-cache'
+    with capture_lock(runtime),closing(cache_connect(root,True)) as cache,cache:
+        analysis=cache.execute('UPDATE chunks SET attempts=0,error=NULL WHERE attempts>=3').rowcount
+        embeddings=cache.execute('''UPDATE chunks SET embedding_attempts=0,embedding_error=NULL,
+            embedding_retry_at=0 WHERE embedding_attempts>=3''').rowcount
+    return dict(state='retry_scheduled',analysis_chunks=analysis,embedding_chunks=embeddings)
 
 
 def set_enabled(root, enabled):
@@ -71,7 +81,7 @@ def install_schedule(root):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action',choices=['on','off','status','process','brief','embeddings','install-schedule'])
+    parser.add_argument('action',choices=['on','off','status','process','brief','embeddings','install-schedule','retry-held'])
     parser.add_argument('project',nargs='?',default='general')
     parser.add_argument('--max-chunks',type=int,default=None)
     parser.add_argument('--budget-seconds',type=int,default=None)
@@ -81,6 +91,7 @@ def main():
         if args.action in ('on','off'):
             result=set_enabled(ROOT,args.action=='on')
         elif args.action=='install-schedule':result=install_schedule(ROOT)
+        elif args.action=='retry-held':result=retry_held(ROOT)
         elif args.action=='embeddings':
             embeddings_daemon(ROOT);result={'state':'stopped'}
         elif args.action=='process':

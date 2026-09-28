@@ -7,6 +7,9 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
+
+import inbox_sweep
 
 from import_memory import migrate
 from inbox_sweep import sweep, read_guard
@@ -95,6 +98,57 @@ class InboxSweepTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 path.rename(self.inbox / 'renamed.json')
         self.assertEqual(path.read_bytes(), self.raw)
+
+    def test_unchanged_receipts_write_state_once_per_pass(self):
+        for index in range(30):
+            (self.inbox / f'old-{index:03}.json').write_bytes(self.raw)
+        sweep(self.root, settle_seconds=0)
+        original = inbox_sweep.dump_atomic
+        writes = []
+        def track(path, value):
+            if path.name == 'state.json':
+                writes.append(len(json.dumps(value)))
+            return original(path, value)
+        with patch.object(inbox_sweep, 'dump_atomic', side_effect=track):
+            report = sweep(self.root, settle_seconds=0)
+        self.assertEqual(report['already_present'], 30)
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(self.count(), 2)
+
+    def test_budget_continues_past_old_files_to_new_deposit(self):
+        for index in range(8):
+            (self.inbox / f'a-{index:03}.json').write_bytes(self.raw)
+        sweep(self.root, settle_seconds=0)
+        state_path = self.root / 'inbox-sweep' / 'state.json'
+        state = json.loads(state_path.read_text())
+        state['cursor'] = ''
+        state_path.write_text(json.dumps(state))
+        packet = json.loads(self.raw)
+        packet['messages'][0]['text'] = 'SYNTHETIC newly delivered late filename.'
+        final = self.inbox / 'z-new.json'
+        final.write_text(json.dumps(packet))
+        imported = 0
+        for _ in range(3):
+            ticks = iter(range(0, 1000, 20))
+            with patch.object(inbox_sweep.time, 'monotonic', side_effect=lambda: next(ticks)):
+                imported += sweep(self.root, settle_seconds=0)['imported_files']
+        self.assertEqual(imported, 1)
+        self.assertEqual(self.count(), 3)
+        self.assertTrue(final.exists())
+
+    def test_json_escaped_credential_is_held_without_logging_value(self):
+        fake = 'sk-' + 'z' * 32
+        packet = {'format': 'steve-memory/1', 'messages': [{'text': 'SYNTHETIC ' + fake}]}
+        raw = json.dumps(packet).replace('sk-', '\\u0073k-').encode()
+        path = self.inbox / 'escaped.json'
+        path.write_bytes(raw)
+        self.assertFalse(inbox_sweep.SECRET.search(raw.decode()))
+        report = sweep(self.root, settle_seconds=0)
+        self.assertEqual(report['held_files'], 1)
+        self.assertEqual(report['files'][0]['error'], 'possible_credential_review_required')
+        self.assertEqual(self.count(), 1)
+        self.assertEqual(path.read_bytes(), raw)
+        self.assertNotIn(fake, (self.root / 'inbox-sweep' / 'events.log').read_text())
 
 
 if __name__ == '__main__':

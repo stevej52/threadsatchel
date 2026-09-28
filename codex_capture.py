@@ -14,6 +14,8 @@ import sys
 import time
 from uuid import uuid4
 
+from capture_read import MAX_EVENT_BYTES, byte_budget, encode_packets, fair_paths, read_event, read_header
+
 from import_memory import import_file
 
 ROOT = Path(__file__).resolve().parent
@@ -81,7 +83,7 @@ def capture_lock(folder):
 
 
 def source_session(first):
-    if first.get('type') != 'session_meta':
+    if not isinstance(first, dict) or first.get('type') != 'session_meta':
         raise ValueError('Missing leading session_meta')
     meta = first.get('payload')
     if not isinstance(meta, dict):
@@ -160,12 +162,12 @@ def edge_hash(stream, offset):
 
 
 def project_file(path, previous, max_bytes):
+    max_bytes = byte_budget(max_bytes)
     counts = Counter()
     batches, batch, ids = [], [], set()
     path = Path(path).resolve()
     with path.open('rb') as stream:
-        first_line = stream.readline()
-        first = json.loads(first_line)
+        first_line, first = read_header(stream, max_bytes)
         meta, eligible = source_session(first)
         session = meta['id']
         header = digest(first_line)
@@ -180,21 +182,31 @@ def project_file(path, previous, max_bytes):
             offset, paused = 0, False
             if previous:
                 counts['source_restarted'] += 1
-        stream.seek(offset)
         start = offset
-        while stream.tell() - start < max_bytes:
+        if offset == 0:
+            # The already parsed header consumes this pass's byte allowance.
+            offset = len(first_line)
+        stream.seek(offset)
+        remaining = max_bytes - len(first_line)
+        event_capacity = min(MAX_EVENT_BYTES, remaining)
+        if remaining <= 0 and size > offset:
+            counts['oversized_line_blocking'] += 1
+        while remaining > 0:
             location = stream.tell()
-            line = stream.readline()
-            if not line:
+            line, reason = read_event(stream, remaining, event_capacity)
+            if line is None:
+                if reason:
+                    counts[reason] += 1
                 break
-            if not line.endswith(b'\n'):
-                stream.seek(location)
-                counts['partial_tail_deferred'] += 1
-                break
+            remaining -= len(line)
             try:
                 row = json.loads(line)
             except (ValueError, UnicodeError):
                 # Do not advance the durable offset past an unreadable entry.
+                stream.seek(location)
+                counts['malformed_line_blocking'] += 1
+                break
+            if not isinstance(row, dict):
                 stream.seek(location)
                 counts['malformed_line_blocking'] += 1
                 break
@@ -243,59 +255,72 @@ def run(config, dry_run=False):
         if not files:
             report['errors'].append({'reason': 'No transcript files found in configured roots'})
         excluded = set(config.get('excluded_session_ids', []))
-        # Oldest first so an initial backfill cannot starve old sessions.
-        for path in sorted(set(files), key=lambda p: (p.stat().st_mtime, str(p))):
+        max_bytes = byte_budget(config.get('max_bytes_per_session', 32*1024*1024))
+        # A held source must not take the first time slice on every run.
+        for path in fair_paths(files, state.get('scan_after')):
             if time.monotonic() - started > config.get('max_run_seconds', 45):
                 counts['time_budget_reached'] += 1
                 break
             counts['files_checked'] += 1
             try:
                 with path.open('rb') as f:
-                    meta, eligible = source_session(json.loads(f.readline()))
+                    _, header = read_header(f, max_bytes)
+                    meta, eligible = source_session(header)
                 sid = meta['id']
                 if not eligible or sid in excluded:
                     counts['excluded_sessions'] += 1
                     continue
                 meta, checkpoint, batches, scanned = project_file(
-                    path, state['sessions'].get(sid, {}), config.get('max_bytes_per_session', 32*1024*1024))
+                    path, state['sessions'].get(sid, {}), max_bytes)
                 counts.update(scanned)
                 counts['eligible_sessions'] += 1
+                if scanned.get('oversized_line_blocking'):
+                    report['errors'].append({'path': str(path), 'reason':
+                        'event_size_limit: transcript held at byte ' + str(checkpoint['offset']) +
+                        '; source retained; no event skipped'})
                 if checkpoint is None:
                     continue
                 for messages in batches:
                     packet = {'format': 'threadsatchel/1', 'kind': 'excerpt',
                               'title': 'Codex history: ' + str(meta.get('cwd') or sid),
                               'conversation_id': sid, 'messages': messages}
-                    if dry_run:
-                        counts['projected_packets'] += 1
-                        continue
-                    raw = json.dumps(packet, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
-                    packet_path = folder/'packets'/(digest(raw) + '.json')
-                    packet_path.parent.mkdir(parents=True, exist_ok=True)
-                    if packet_path.exists():
-                        if packet_path.read_bytes() != raw:
-                            raise ValueError('Packet content verification failed')
-                    else:
-                        temp = packet_path.with_name('.incoming-' + uuid4().hex + '.json.part')
-                        with temp.open('xb') as f:
-                            f.write(raw)
-                            f.flush()
-                            os.fsync(f.fileno())
-                        if temp.read_bytes() != raw:
-                            raise ValueError('Packet read-back failed')
-                        # Exclusive lock covers this directory. Windows rename does not overwrite.
-                        os.rename(temp, packet_path)
-                    result = import_file(packet_path, Path(config['db_path']))
-                    for key in ('added_revisions', 'reused_messages', 'repeated_packets', 'linked_entities'):
-                        counts[key] += result[key]
-                    counts['import_warnings'] += len(result['warnings'])
-                    counts['uncertain_matches'] += len(result['uncertain'])
+                    for raw in encode_packets(packet):
+                        if dry_run:
+                            counts['projected_packets'] += 1
+                            continue
+                        packet_path = folder/'packets'/(digest(raw) + '.json')
+                        packet_path.parent.mkdir(parents=True, exist_ok=True)
+                        if packet_path.exists():
+                            if packet_path.read_bytes() != raw:
+                                raise ValueError('Packet content verification failed')
+                        else:
+                            temp = packet_path.with_name('.incoming-' + uuid4().hex + '.json.part')
+                            with temp.open('xb') as f:
+                                f.write(raw)
+                                f.flush()
+                                os.fsync(f.fileno())
+                            if temp.read_bytes() != raw:
+                                raise ValueError('Packet read-back failed')
+                            # Exclusive lock covers this directory. Windows rename does not overwrite.
+                            os.rename(temp, packet_path)
+                        result = import_file(packet_path, Path(config['db_path']))
+                        for key in ('added_revisions', 'reused_messages', 'repeated_packets', 'linked_entities'):
+                            counts[key] += result[key]
+                        counts['import_warnings'] += len(result['warnings'])
+                        counts['uncertain_matches'] += len(result['uncertain'])
                 if not dry_run:
                     # Commit to the existing importer first; crash/retry is idempotent.
                     state['sessions'][sid] = checkpoint
                     dump_atomic(state_path, state)
             except Exception as exc:
                 report['errors'].append({'path': str(path), 'reason': type(exc).__name__ + ': ' + str(exc)})
+            finally:
+                if not dry_run:
+                    state['scan_after'] = str(path)
+        if not dry_run:
+            # A scheduling cursor is not an import checkpoint. Failed imports
+            # leave their durable byte offset unchanged while other files run.
+            dump_atomic(state_path, state)
         report['counts'] = dict(counts)
         report['finished_at'] = stamp()
         report['elapsed_seconds'] = round(time.monotonic() - started, 3)

@@ -27,7 +27,15 @@ Each source stores its byte cursor and filtered queue locally. A checkpoint adva
 
 A source can capture while the archive is unavailable; transfer catches up after reconnection. Windows tasks require the owner to be logged in. Linux timers require the user systemd manager to be running; the installer does not enable lingering or change login policy. Sleeping/powered-off machines cannot run capture. Missing/deleted source logs cannot be reconstructed.
 
-Runs are bounded by bytes and elapsed scan time; initial history can take several cycles. A partial final JSONL line waits for the next run. Malformed JSON stops that file's cursor and is reported. Status files describe the most recent run, not lifetime totals.
+Runs are bounded by bytes and elapsed scan time; initial history can take several cycles. Both collectors share `capture_read.py`; include that module when updating a source installation. Metadata headers are limited to 64 KiB and individual events to 1 MiB. `max_bytes_per_session` is a per-pass allowance from 256 bytes through 32 MiB, with a default of 32 MiB. Header reads consume that allowance, so setting it too low can hold an otherwise supported event. Edge-hash verification adds at most 1 KiB per check.
+
+A partial final JSONL line waits for the next run. A complete event that exceeds the remaining pass allowance is deferred until the next pass; it is never partially parsed. A header or event exceeding its limit is held with an observable error, retaining the original transcript and the checkpoint before that event. Malformed JSON also stops that file's cursor and is reported. Resolve a held source deliberately; do not advance its checkpoint by hand or discard the original. Status files describe the most recent run, not lifetime totals.
+
+Each pass resumes its file scan after the last attempted source. A held or oversized transcript therefore cannot take every run's time allowance and indefinitely starve other sessions. This scan cursor is separate from each transcript's import checkpoint: a failed import still retains its original byte offset.
+
+Generated packets are limited to 8 MiB after serialization. An oversized batch is split deterministically between messages; message text, recorded IDs and format markers remain unchanged. Packets already under the limit retain their original byte representation. The checkpoint advances only after every piece has been durably written or imported.
+
+An older oversized or corrupt queue file remains available for diagnosis and is never acknowledged as delivered. The transport skips it so healthy queued packets can proceed. Existing central sync status includes `transport_held_count` and a bounded `transport_held` detail list alongside the original collector status. Update `capture_read.py` and `capture_transport.py` with both capture entry points when upgrading source computers.
 
 ## Coverage and privacy controls
 

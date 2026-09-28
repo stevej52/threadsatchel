@@ -1,14 +1,19 @@
 """Optional, local-only derived memory aids. The authoritative archive is read-only."""
 from contextlib import closing
+from collections import OrderedDict
+import atexit
 from datetime import datetime, timezone
 import hashlib
 import ipaddress
+from itertools import count
 import json
 import math
 from pathlib import Path
 import re
 import sqlite3
+import threading
 import time
+from types import MappingProxyType
 import urllib.parse
 import urllib.request
 
@@ -77,12 +82,41 @@ def load_config(root):
 
 
 def config_fingerprint(config):
-    return digest(encoded(dict(version=VERSION, config=config)))
+    # Only inputs to interpretation invalidate model work. Runtime/batch tuning does not.
+    return digest(encoded(dict(version=VERSION, config={k: config.get(k) for k in
+        ('endpoint', 'model', 'chat_model_revision', 'projects', 'include_unassigned')})))
+
+
+def legacy_config_fingerprint(config):
+    return digest(encoded(dict(version=VERSION, config={k:v for k,v in config.items() if k!='chat_api_key_file'})))
+
+
+def migrate_analysis_identity(cache, previous_config, current_config):
+    """Preserve old analyses after a proven runtime-only settings/path change.
+
+    The owner may supply their saved prior configuration during deployment. No
+    guessed legacy identity is accepted, and changed model/prompt/project inputs
+    cannot migrate interpretations across incompatible versions.
+    """
+    current=config_fingerprint(current_config)
+    if config_fingerprint(previous_config)!=current:
+        return 0
+    old=legacy_config_fingerprint(previous_config)
+    with cache:
+        changed=cache.execute('UPDATE chunks SET analysis_version=? WHERE analysis_version=?',(current,old)).rowcount
+        # Interpretations remain valid, but old summaries/ranking may contain the
+        # duplicate-per-memory presentation fixed by this release. Rebuild them.
+        cache.execute('DELETE FROM responses WHERE config_version=?',(old,))
+        cache.execute("UPDATE state SET value=? WHERE key='config_version' AND value=?",(current,old))
+    return changed
 
 
 def source_fingerprint(record):
-    return digest(encoded({k: record.get(k) for k in
-        ('id', 'text', 'title', 'source', 'created_at', 'source_ids')}))
+    value = {k: record.get(k) for k in
+        ('id', 'text', 'title', 'source', 'created_at', 'source_ids')}
+    if value['source_ids'] is not None:
+        value['source_ids'] = dict(value['source_ids'])
+    return digest(encoded(value))
 
 
 def archive_connect(root):
@@ -120,9 +154,8 @@ def project_for(record, config):
     return 'general' if config.get('include_unassigned', True) else None
 
 
-def split_text(text, max_bytes=1200):
+def split_text(text, max_bytes=1200, start=0):
     """Deterministic overlapping original-text windows, including all long records."""
-    start = 0
     while start < len(text):
         end, size = start, 0
         while end < len(text) and size + len(text[end].encode('utf-8')) <= max_bytes:
@@ -147,6 +180,7 @@ CREATE TABLE IF NOT EXISTS chunks(id TEXT PRIMARY KEY,memory_id TEXT NOT NULL,pa
 CREATE INDEX IF NOT EXISTS chunks_memory ON chunks(memory_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS aids_fts USING fts5(id UNINDEXED,terms,tokenize='unicode61');
 CREATE TABLE IF NOT EXISTS responses(key TEXT PRIMARY KEY,archive_version TEXT NOT NULL,config_version TEXT NOT NULL,result TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS indexing(id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,cursor INTEGER NOT NULL,part INTEGER NOT NULL);
 '''
 
 
@@ -155,12 +189,47 @@ def cache_connect(root, create=False):
     if create:
         path.parent.mkdir(exist_ok=True)
         db = sqlite3.connect(path, timeout=3)
+        db.execute('PRAGMA journal_mode=WAL')
         db.executescript(SCHEMA)
+        columns = {row[1] for row in db.execute('PRAGMA table_info(chunks)')}
+        for name, definition in (
+                ('embedding_attempts','INTEGER NOT NULL DEFAULT 0'),
+                ('embedding_error','TEXT'), ('embedding_retry_at','REAL NOT NULL DEFAULT 0'),
+                ('embedding_attempt_version','TEXT')):
+            if name not in columns:
+                db.execute('ALTER TABLE chunks ADD COLUMN '+name+' '+definition)
+        if db.execute('PRAGMA user_version').fetchone()[0] < 3:
+            db.execute('PRAGMA user_version=3')
+        db.commit()
     else:
         db = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=2)
         db.execute('PRAGMA query_only=ON')
     db.row_factory = sqlite3.Row
     return db
+
+
+def migrate_cache_payloads(cache, max_vectors=256):
+    """Bounded, inference-free upgrade of disposable vectors and obsolete empty windows."""
+    from ai_embeddings import pack_vector,unpack_vector
+    report=dict(converted_vectors=0,invalid_vectors=0,removed_empty_windows=0)
+    with cache:
+        for row in cache.execute("SELECT id,vector FROM chunks WHERE typeof(vector)='text' LIMIT ?",
+                                 (max(1,min(int(max_vectors),1000)),)).fetchall():
+            try:
+                cache.execute('UPDATE chunks SET vector=? WHERE id=?',
+                    (pack_vector(unpack_vector(row['vector'])),row['id']))
+                report['converted_vectors']+=1
+            except Exception:
+                cache.execute('UPDATE chunks SET vector=NULL,embedding_version=NULL WHERE id=?',(row['id'],))
+                report['invalid_vectors']+=1
+        if not cache.execute("SELECT 1 FROM state WHERE key='whitespace_windows_removed'").fetchone():
+            empty=[r['id'] for r in cache.execute('SELECT id,text FROM chunks') if not r['text'].strip()]
+            for cid in empty:
+                cache.execute('DELETE FROM aids_fts WHERE id=?',(cid,))
+                cache.execute('DELETE FROM chunks WHERE id=?',(cid,))
+            cache.execute("INSERT INTO state VALUES('whitespace_windows_removed','1')")
+            report['removed_empty_windows']=len(empty)
+    return report
 
 
 def current_sources(db, config):
@@ -171,39 +240,132 @@ def current_sources(db, config):
     return records, version
 
 
+_observers = OrderedDict()
+_observers_lock = threading.RLock()
+_observer_epochs = count()
+
+
+def _file_identity(path):
+    stat = path.stat()
+    # Identity detects atomic replacement; SQLite data_version detects commits, including WAL.
+    return stat.st_dev, stat.st_ino, getattr(stat, 'st_birthtime_ns', 0)
+
+
+def _observer(path):
+    key = str(Path(path).resolve())
+    identity = _file_identity(Path(path))
+    entry = _observers.get(key)
+    if entry is None or entry['identity'] != identity:
+        if entry:
+            entry['db'].close()
+        db = sqlite3.connect(Path(path).resolve().as_uri()+'?mode=ro', uri=True,
+                             timeout=2, check_same_thread=False)
+        db.row_factory = sqlite3.Row
+        db.execute('PRAGMA query_only=ON')
+        entry = dict(db=db, identity=identity, sources={},epoch=next(_observer_epochs))
+        _observers[key] = entry
+    _observers.move_to_end(key)
+    while len(_observers)>6:
+        _, old = _observers.popitem(last=False)
+        old['db'].close()
+    return entry
+
+
+def close_cached_readers(root=None):
+    """Release read-only handles for shutdown/tests or an intentional database replacement."""
+    with _observers_lock:
+        for key in list(_observers):
+            if root is None or Path(root).resolve() in Path(key).parents:
+                _observers.pop(key)['db'].close()
+
+
+atexit.register(close_cached_readers)
+
+
+def cache_generation(root):
+    with _observers_lock:
+        entry = _observer(Path(root)/'.ai-cache'/'index.sqlite3')
+        return entry['identity'],entry['epoch'],entry['db'].execute('PRAGMA data_version').fetchone()[0]
+
+
+def cached_sources(root, db, config, release_snapshot=False):
+    if db.in_transaction and not release_snapshot:
+        # Respect a caller's older transaction snapshot. It cannot share a current cache.
+        return current_sources(db, config)
+    if db.in_transaction:
+        db.rollback()
+    mapping = encoded({k:config.get(k) for k in ('projects','include_unassigned')})
+    with _observers_lock:
+        entry = _observer(Path(root)/'memory.sqlite3')
+        reader = entry['db']
+        generation = reader.execute('PRAGMA data_version').fetchone()[0]
+        saved = entry['sources'].get(mapping)
+        if saved and saved[0] == generation:
+            return saved[1], saved[2]
+        for _ in range(3):
+            generation = reader.execute('PRAGMA data_version').fetchone()[0]
+            reader.execute('BEGIN')
+            try:
+                records, version = current_sources(reader, config)
+            finally:
+                reader.rollback()
+            frozen = tuple(MappingProxyType(dict(r, source_ids=MappingProxyType(dict(r['source_ids']))))
+                           for r in records)
+            if reader.execute('PRAGMA data_version').fetchone()[0] == generation:
+                entry['sources'] = {mapping:(generation, frozen, version)}
+                return frozen, version
+        # A busy archive still yields a consistent snapshot, but never a reusable stale cache.
+        return frozen, version
+
+
 def sync_sources(cache, records, config, max_changed=None, deadline=None):
     existing = {r['id']: r['fingerprint'] for r in cache.execute('SELECT id,fingerprint FROM records')}
+    partial = {r['id']: dict(r) for r in cache.execute('SELECT * FROM indexing')}
     actual = {record['id'] for record in records}
-    count = 0
-    changed = 0
+    count = changed = 0
     with cache:
         for record in sorted(records,key=lambda r:r.get('created_at',''),reverse=True):
-            mid, fp = record['id'], source_fingerprint(record)
-            if existing.get(mid) == fp:
-                # Mapping changes invalidate labels even when source bytes do not change.
-                cache.execute('UPDATE records SET project=? WHERE id=?', (project_for(record,config),mid))
+            mid = record['id']
+            fp = record.get('_source_fingerprint') or source_fingerprint(record)
+            pending = partial.get(mid)
+            if existing.get(mid) == fp and not pending:
+                cache.execute('UPDATE records SET project=? WHERE id=? AND project!=?',
+                    (project_for(record,config),mid,project_for(record,config)))
                 continue
-            # Invalidate old evidence even when bounded rebuilding must wait.
-            if mid in existing:
+            if existing.get(mid) != fp:
+                # Stale evidence is removed even if the rebuild budget is exhausted.
                 cache.execute('DELETE FROM aids_fts WHERE id IN (SELECT id FROM chunks WHERE memory_id=?)',(mid,))
                 cache.execute('DELETE FROM chunks WHERE memory_id=?',(mid,))
                 cache.execute('DELETE FROM records WHERE id=?',(mid,))
+                cache.execute('DELETE FROM indexing WHERE id=?',(mid,))
+                pending = None
             if (max_changed is not None and changed >= max_changed) or (deadline is not None and time.monotonic() >= deadline):
                 continue
             changed += 1
-            cache.execute('DELETE FROM aids_fts WHERE id IN (SELECT id FROM chunks WHERE memory_id=?)',(mid,))
-            cache.execute('DELETE FROM chunks WHERE memory_id=?',(mid,))
+            cursor, part = (pending['cursor'],pending['part']) if pending else (0,0)
             cache.execute('INSERT OR REPLACE INTO records VALUES(?,?,?,?)',
-                (mid,fp,project_for(record,config),encoded(record['source_ids'])))
-            for part,(start,end,text) in enumerate(split_text(record['text'])):
-                cid=digest(mid+fp+str(part))
-                cache.execute('INSERT INTO chunks(id,memory_id,part,start,end,text,title,source,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
-                    (cid,mid,part,start,end,text,record.get('title'),record['source'],record['created_at']))
-                count += 1
+                (mid,fp,project_for(record,config),encoded(dict(record['source_ids']))))
+            complete = True
+            for start,end,text in split_text(record['text'],start=cursor):
+                if deadline is not None and time.monotonic() >= deadline:
+                    complete = False
+                    break
+                if text.strip():
+                    cid=digest(mid+fp+str(part))
+                    cache.execute('INSERT OR IGNORE INTO chunks(id,memory_id,part,start,end,text,title,source,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
+                        (cid,mid,part,start,end,text,record.get('title'),record['source'],record['created_at']))
+                    count += 1
+                part += 1
+                cursor = len(record['text']) if end >= len(record['text']) else max(start+1,end-min(100,(end-start)//5))
+            if complete:
+                cache.execute('DELETE FROM indexing WHERE id=?',(mid,))
+            else:
+                cache.execute('INSERT OR REPLACE INTO indexing VALUES(?,?,?,?)',(mid,fp,cursor,part))
         for mid in existing.keys()-actual:
             cache.execute('DELETE FROM aids_fts WHERE id IN (SELECT id FROM chunks WHERE memory_id=?)',(mid,))
             cache.execute('DELETE FROM chunks WHERE memory_id=?',(mid,))
             cache.execute('DELETE FROM records WHERE id=?',(mid,))
+            cache.execute('DELETE FROM indexing WHERE id=?',(mid,))
     return count
 
 
@@ -229,22 +391,35 @@ class LocalChat:
         raw = encoded(body).encode('utf-8') if body is not None else None
         if raw is not None and len(raw)>24000:
             raise ValueError('Model input exceeds request budget')
-        req=urllib.request.Request(self.endpoint+path,data=raw,headers={'Content-Type':'application/json'})
-        with self.opener.open(req, timeout=timeout) as response:
-            data=response.read(65537)
-        if len(data)>65536:
-            raise ValueError('Model response exceeds budget')
-        return json.loads(data)
+        from ai_embeddings import bounded_json_request
+        parsed = urllib.parse.urlsplit(self.endpoint)
+        secret = None
+        if self.config.get('chat_api_key_file'):
+            try:
+                secret_path=Path(self.config['chat_api_key_file'])
+                if not secret_path.is_absolute() or str(secret_path).startswith(('\\\\','//')) or not secret_path.is_file():
+                    raise ValueError()
+                with secret_path.open('rb') as stream:
+                    raw_secret=stream.read(1025)
+                secret=raw_secret.decode('ascii').strip()
+                if len(raw_secret)>1024 or not 32<=len(secret)<=512 or not re.fullmatch(r'[A-Za-z0-9_\-]+',secret):
+                    raise ValueError()
+            except Exception:
+                raise ValueError('Invalid local chat credential file') from None
+        return bounded_json_request(parsed.hostname, parsed.port or 80,
+            'GET' if raw is None else 'POST', path, raw, timeout, 65536,authorization=secret)
 
-    def available(self):
+    def available(self, timeout=2):
         try:
-            slots=self.request('/slots')
+            slots=self.request('/slots',timeout=timeout)
             return isinstance(slots,list) and bool(slots) and not any(s.get('is_processing',True) for s in slots)
         except Exception:
             return False
 
     def complete(self, system, content, max_tokens=400, timeout=None, response_schema=None):
-        if not self.available():
+        budget = timeout or self.config['chat_timeout_seconds']
+        deadline = time.monotonic()+budget
+        if not self.available(timeout=min(2,budget)):
             raise RuntimeError('model_busy_or_unavailable')
         response_format = {'type': 'json_object'}
         if response_schema is not None:
@@ -253,7 +428,7 @@ class LocalChat:
         result=self.request('/v1/chat/completions',dict(model=self.config['model'],
             messages=[dict(role='system',content=system),dict(role='user',content=encoded(content))],
             temperature=0,max_tokens=max_tokens,stream=False,cache_prompt=True,
-            response_format=response_format), timeout or self.config['chat_timeout_seconds'])
+            response_format=response_format), max(.001,deadline-time.monotonic()))
         choice = result['choices'][0]
         if choice.get('finish_reason') == 'length':
             raise ValueError('Model response exceeded token budget')
@@ -333,6 +508,15 @@ def process(root, max_records=6, budget_seconds=90, chat_client=None, embedding_
             indexed=sync_sources(cache,records,config,max_changed=128,deadline=started+budget_seconds)
             cfgversion=config_fingerprint(config)
             previous=cache.execute("SELECT value FROM state WHERE key='config_version'").fetchone()
+            # Same model/prompt/source contract: translate the old all-settings identity
+            # once, preserving expensive valid interpretations during this upgrade.
+            if previous and previous['value']==legacy_config_fingerprint(config):
+                with cache:
+                    cache.execute('UPDATE chunks SET analysis_version=? WHERE analysis_version=?',
+                                  (cfgversion,previous['value']))
+                    cache.execute('DELETE FROM responses WHERE config_version=?',
+                                  (previous['value'],))
+                previous={'value':cfgversion}
             if not previous or previous['value']!=cfgversion:
                 with cache:
                     cache.execute('UPDATE chunks SET attempts=0,error=NULL')
@@ -348,26 +532,42 @@ def process(root, max_records=6, budget_seconds=90, chat_client=None, embedding_
                     report['errors'].append('embedding_'+type(error).__name__)
                     embedding_client=None
             ev=embedding_client.model_fingerprint if embedding_client else ''
+            from ai_embeddings import pack_vector
+            migrate_cache_payloads(cache)
+            with cache:
+                if ev:
+                    cache.execute('''UPDATE chunks SET embedding_attempts=0,embedding_error=NULL,
+                        embedding_retry_at=0,embedding_attempt_version=?
+                        WHERE coalesce(embedding_attempt_version,'')!=?''',(ev,ev))
             # Failed interpretations get at most three attempts, then stay visible for review.
+            analysis_ready=not embeddings_only and chat.available()
+            if not embeddings_only and not analysis_ready:
+                report['state']='deferred'
             rows=cache.execute('''SELECT * FROM (
                 SELECT c.*,r.project,ROW_NUMBER() OVER (
-                    PARTITION BY r.project ORDER BY c.created_at DESC,c.memory_id,c.part
+                    PARTITION BY r.project ORDER BY c.embedding_attempts,c.attempts,c.created_at DESC,c.memory_id,c.part
                 ) AS project_position FROM chunks c JOIN records r ON r.id=c.memory_id
                 WHERE (?=0 AND coalesce(analysis_version,'')!=? AND attempts<3)
-                OR (?!='' AND coalesce(embedding_version,'')!=?)
+                OR (?!='' AND coalesce(embedding_version,'')!=? AND embedding_attempts<3 AND embedding_retry_at<=?)
                 ) ORDER BY project_position,project LIMIT ?''',
-                (int(embeddings_only),cfgversion,ev,ev,max(1,min(int(max_records),100)))).fetchall()
+                (int(not analysis_ready),cfgversion,ev,ev,time.time(),max(1,min(int(max_records),100)))).fetchall()
             for row in rows:
                 if time.monotonic()-started>budget_seconds or not load_config(root)['enabled']:
                     report['state']='partial';break
                 chunk=dict(row)
-                if embedding_client and chunk['embedding_version']!=ev:
+                if (embedding_client and chunk['embedding_version']!=ev and chunk['embedding_attempts']<3
+                        and chunk['embedding_retry_at']<=time.time()):
                     try:
                         vector=embedding_client.embed([chunk['text']])[0]
                         with cache:
-                            cache.execute('UPDATE chunks SET vector=?,embedding_version=? WHERE id=?',(encoded(vector),ev,chunk['id']))
+                            cache.execute('''UPDATE chunks SET vector=?,embedding_version=?,embedding_attempts=0,
+                                embedding_error=NULL,embedding_retry_at=0 WHERE id=?''',(pack_vector(vector),ev,chunk['id']))
                         report['embedded_chunks']+=1
                     except Exception as error:
+                        with cache:
+                            cache.execute('''UPDATE chunks SET embedding_attempts=embedding_attempts+1,
+                                embedding_error=?,embedding_retry_at=? WHERE id=?''',
+                                (type(error).__name__,time.time()+30*(2**chunk['embedding_attempts']),chunk['id']))
                         report['errors'].append('embedding_'+type(error).__name__)
                 if not embeddings_only and chunk['analysis_version']!=cfgversion and chunk['attempts']<3:
                     if not chat.available():
@@ -400,9 +600,10 @@ def process(root, max_records=6, budget_seconds=90, chat_client=None, embedding_
                     brief.update(source_fingerprint=version)
                     cache.execute('INSERT OR REPLACE INTO responses VALUES(?,?,?,?)',
                         ('brief:'+project,version,cfgversion,encoded(brief)))
-            fingerprints={r['id']:source_fingerprint(r) for r in records}
+            fingerprints={r['id']:r.get('_source_fingerprint') or source_fingerprint(r) for r in records}
             indexed_current=sum(fingerprints.get(r['id'])==r['fingerprint'] for r in cache.execute('SELECT id,fingerprint FROM records'))
-            report.update(pending_source_records=len(records)-indexed_current,
+            report.update(pending_source_records=len(records)-indexed_current+cache.execute('SELECT count(*) FROM indexing').fetchone()[0],
+                held_embeddings=cache.execute('SELECT count(*) FROM chunks WHERE embedding_attempts>=3').fetchone()[0],
                 pending_analysis=cache.execute("SELECT count(*) FROM chunks WHERE coalesce(analysis_version,'')!=?",(cfgversion,)).fetchone()[0],
                 pending_embeddings=cache.execute("SELECT count(*) FROM chunks WHERE vector IS NULL OR (?!='' AND coalesce(embedding_version,'')!=?)",(ev,ev)).fetchone()[0])
             if report['state']=='ok' and (report['pending_source_records'] or report['pending_analysis'] or (config['embeddings'] and report['pending_embeddings'])):
@@ -412,13 +613,17 @@ def process(root, max_records=6, budget_seconds=90, chat_client=None, embedding_
 
 
 def build_brief(cache, project, cfgversion):
-    rows=cache.execute('''SELECT c.*,r.source_ids,r.fingerprint AS source_fingerprint FROM chunks c JOIN records r ON r.id=c.memory_id
-        WHERE r.project=? AND c.analysis_version=? ORDER BY c.created_at DESC,c.memory_id,c.part LIMIT 50''',
+    rows=cache.execute('''SELECT * FROM (SELECT c.*,r.source_ids,r.fingerprint AS source_fingerprint,
+        row_number() OVER(PARTITION BY c.memory_id ORDER BY c.part) AS memory_position
+        FROM chunks c JOIN records r ON r.id=c.memory_id
+        WHERE r.project=? AND c.analysis_version=?)
+        ORDER BY memory_position,created_at DESC,memory_id LIMIT 50''',
         (project,cfgversion)).fetchall()
-    facts=[];summaries=[];groups={};seen=set()
+    facts=[];summaries=[];groups={};seen=set();summary_ids=set()
     for row in rows:
         analysis=json.loads(row['analysis'])
-        if len(summaries)<8:
+        if len(summaries)<8 and row['memory_id'] not in summary_ids:
+            summary_ids.add(row['memory_id'])
             summaries.append(dict(memory_id=row['memory_id'],summary=analysis['summary'],
                 source_ids=json.loads(row['source_ids']),source_fingerprint=row['source_fingerprint']))
         for fact in analysis['facts']:
@@ -436,9 +641,13 @@ def build_brief(cache, project, cfgversion):
         for k,items in groups.items() if len({x['value'].casefold() for x in items})>1]
     total=cache.execute('SELECT count(*) FROM chunks c JOIN records r ON r.id=c.memory_id WHERE r.project=?',(project,)).fetchone()[0]
     ready=cache.execute('SELECT count(*) FROM chunks c JOIN records r ON r.id=c.memory_id WHERE r.project=? AND c.analysis_version=?',(project,cfgversion)).fetchone()[0]
-    return dict(project=project,state='ready' if total and total==ready else 'partial' if ready else 'pending',
+    unfinished=cache.execute('SELECT count(*) FROM indexing i JOIN records r ON r.id=i.id WHERE r.project=?',(project,)).fetchone()[0]
+    distinct=cache.execute('SELECT count(DISTINCT c.memory_id) FROM chunks c JOIN records r ON r.id=c.memory_id WHERE r.project=? AND c.analysis_version=?',(project,cfgversion)).fetchone()[0]
+    return dict(project=project,state='ready' if total and total==ready and not unfinished else 'partial' if ready else 'pending',
         generated=True,facts=facts,summaries=summaries,possible_conflicts=conflicts,
-        coverage=dict(analyzed_chunks=ready,total_chunks=total),
+        coverage=dict(analyzed_chunks=ready,total_chunks=total,indexing_records=unfinished,
+            represented_summary_records=len(summaries),analyzed_records=distinct,
+            truncated=ready>len(rows) or distinct>len(summaries) or len(facts)>=24),
         caution='Model interpretations with original evidence. Import order is not decision order. '
         'Proposals never automatically replace decisions; conflicting decisions require source review.')
 
@@ -448,7 +657,7 @@ def project_brief(root, db, project):
     if not config['enabled']:
         return dict(project=project,state='off',generated=False)
     try:
-        records,version=current_sources(db,config)
+        records,version=cached_sources(root,db,config)
         cfgversion=config_fingerprint(config)
         with closing(cache_connect(root)) as cache:
             row=cache.execute('SELECT * FROM responses WHERE key=?',('brief:'+project,)).fetchone()
@@ -482,7 +691,7 @@ def project_brief(root, db, project):
 def _compact(record, text):
     return dict(id=record['id'],title=(record.get('title') or '')[:240] or None,
         source=record['source'][:240],
-        created_at=record['created_at'],text=text[:600],source_ids=record.get('source_ids',{}))
+        created_at=record['created_at'],text=text[:600],source_ids=dict(record.get('source_ids',{})))
 
 
 def enhance_search(root, db, query, hits, limit, *, release_snapshot=False):
@@ -508,117 +717,119 @@ def enhance_search(root, db, query, hits, limit, *, release_snapshot=False):
     if exact_id or exact_part or strong_short:
         if release_snapshot and db.in_transaction:db.rollback()
         return hits[:limit]
-    from collections import OrderedDict
-    import threading
     root=Path(root)
-    memo_lock,memo=enhance_search.__dict__.setdefault(
-        '_response_cache',(threading.RLock(),OrderedDict()))
-
-    def file_signature(path):
-        try:
-            stat=path.stat()
-            return stat.st_dev,stat.st_ino,stat.st_size,stat.st_mtime_ns,stat.st_ctime_ns
-        except OSError:
-            return None
-
-    index_path=root/'.ai-cache'/'index.sqlite3'
-
-    def index_signature():
-        return file_signature(index_path),file_signature(Path(str(index_path)+'-wal'))
-
-    # Cache readiness is checked before scanning the archive. Feature opt-in alone
-    # must not make the source-only fallback expensive when no derived index exists.
+    memo_lock,memo=enhance_search.__dict__.setdefault('_response_cache',(threading.RLock(),OrderedDict()))
+    matrix_lock,matrices=enhance_search.__dict__.setdefault('_matrices',(threading.RLock(),OrderedDict()))
     try:
-        signature_before=index_signature()
+        generation=cache_generation(root)
+        records,version=cached_sources(root,db,config,release_snapshot=release_snapshot)
+        sources={r['id']:r for r in records}
+        fingerprints={r['id']:r.get('_source_fingerprint') or source_fingerprint(r) for r in records}
+        cfgversion=config_fingerprint(config)
+        retrieval_settings=digest(encoded({k:config.get(k) for k in
+            ('embeddings','rerank','embedding_endpoint','embedding_model_path')}))
+        model_path=config.get('embedding_model_path')
+        model_signature=None
+        if model_path:
+            model_path=Path(model_path).expanduser()
+            if not model_path.is_absolute():model_path=root/model_path
+            info=model_path.stat()
+            model_signature=(_file_identity(model_path),info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+        key=(str(root.resolve()),version,cfgversion,retrieval_settings,query,limit,
+             digest(encoded(hits)),generation,model_signature)
+        with memo_lock:
+            saved=memo.get(key)
+            if saved and time.monotonic()-saved[0]<30:
+                memo.move_to_end(key)
+                return json.loads(saved[1])
+        # The lexical transaction may precede this source snapshot. Preserve its
+        # ranking, but never cache an older body/provenance under a newer generation.
+        from memory_search import _excerpt
+        pattern=re.compile(r'\b(?:'+'|'.join(re.escape(t) for t in literal_terms)+r')\b',re.I) if literal_terms else None
+        scored={}
+        for i,hit in enumerate(hits):
+            source=sources.get(hit['id'])
+            if source is not None:
+                text=hit.get('text','')
+                if not text or text not in source['text']:
+                    text=_excerpt(source['text'],pattern)
+                scored[hit['id']]=[1/(40+i),_compact(source,text)]
+        channels={}
+        def add(row, rank, channel, weight=1.0):
+            mid=row['memory_id']
+            if fingerprints.get(mid)!=row['fingerprint']:return
+            score=weight/(40+rank)
+            old=channels.get((mid,channel),0)
+            if score<=old:return
+            channels[(mid,channel)]=score
+            if mid in scored:scored[mid][0]+=score-old
+            else:scored[mid]=[score,_compact(sources[mid],row['text'])]
+        terms=list(dict.fromkeys(t.casefold() for t in re.findall(r'[^\W_]+',query)
+                                 if t.casefold() not in STOP_WORDS))[:24]
+        # Fetch SQLite evidence, then close every read transaction before model I/O.
         with closing(cache_connect(root)) as cache:
             cache.execute('BEGIN')
-            cache.execute('SELECT value FROM state LIMIT 1').fetchone()
-            snapshot_signature=index_signature()
-            stable_index=signature_before==snapshot_signature
-            owns_source_snapshot=release_snapshot or not db.in_transaction
-            try:
-                if not db.in_transaction:
-                    db.execute('BEGIN')
-                records,version=current_sources(db,config)
-            finally:
-                if owns_source_snapshot and db.in_transaction:
-                    db.rollback()
-            sources={r['id']:r for r in records}
-            fingerprints={r['id']:r.get('_source_fingerprint') or source_fingerprint(r)
-                          for r in records}
-            cfgversion=config_fingerprint(config)
-            model_path=config.get('embedding_model_path')
-            if model_path:
-                model_path=Path(model_path).expanduser()
-                if not model_path.is_absolute():model_path=root/model_path
-            model_signature=file_signature(model_path) if model_path else None
-            key=(str(root.resolve()),version,cfgversion,query,limit,digest(encoded(hits)),
-                 snapshot_signature,model_signature)
-            if stable_index:
-                with memo_lock:
-                    saved=memo.get(key)
-                    if saved and time.monotonic()-saved[0]<30:
-                        memo.move_to_end(key)
-                        # Cached JSON owns its data; a caller cannot poison later results.
-                        return json.loads(saved[1])
-                    if saved:memo.pop(key,None)
-            scored={h['id']:[1/(40+i),h] for i,h in enumerate(hits)}
-
-            def add(row, rank, weight=1.0):
-                mid=row['memory_id']
-                if fingerprints.get(mid)!=row['fingerprint']:return
-                score=weight/(40+rank)
-                if mid in scored:scored[mid][0]+=score
-                else:scored[mid]=[score,_compact(sources[mid],row['text'])]
-
-            from memory_search import STOP_WORDS
-            terms=list(dict.fromkeys(t.casefold() for t in re.findall(r'[^\W_]+',query)
-                                     if t.casefold() not in STOP_WORDS))[:24]
             if terms:
                 expr=' OR '.join('"'+t+'"' for t in terms)
-                ranked=list(cache.execute('SELECT id FROM aids_fts WHERE aids_fts MATCH ? '
-                                          'ORDER BY rank LIMIT 20',(expr,)))
-                ids=[r['id'] for r in ranked]
+                ranked=cache.execute('''SELECT c.id,c.memory_id,c.analysis_version,r.fingerprint
+                    FROM aids_fts JOIN chunks c ON c.id=aids_fts.id JOIN records r ON r.id=c.memory_id
+                    WHERE aids_fts MATCH ? ORDER BY aids_fts.rank''',(expr,))
+                selected=[];seen=set()
+                for row in ranked:
+                    if row and row['memory_id'] not in seen and row['analysis_version']==cfgversion and fingerprints.get(row['memory_id'])==row['fingerprint']:
+                        selected.append(row['id']);seen.add(row['memory_id'])
+                        if len(selected)>=max(20,limit):break
+                if selected:
+                    winners={r['id']:r for r in cache.execute('SELECT c.id,c.memory_id,c.text,r.fingerprint FROM chunks c '
+                        'JOIN records r ON r.id=c.memory_id WHERE c.id IN ('+','.join('?' for _ in selected)+')',selected)}
+                    for rank,cid in enumerate(selected):
+                        if cid in winners:add(winners[cid],rank,'analysis',.7)
+            has_vectors=config['embeddings'] and cache.execute('SELECT 1 FROM chunks WHERE vector IS NOT NULL LIMIT 1').fetchone()
+        if has_vectors:
+            try:
+                from ai_embeddings import EmbeddingClient,VectorIndex
+                query_config=dict(config,embedding_timeout_seconds=2)
+                with EmbeddingClient(query_config,root) as client:
+                    client.ensure_ready(allow_launch=False)
+                    vector=client.embed([query],query=True)[0]
+                    matrix_key=(str(root.resolve()),generation,client.model_fingerprint)
+                    with matrix_lock:
+                        saved=matrices.get(matrix_key)
+                    if saved is None:
+                        groups={};evidence={}
+                        with closing(cache_connect(root)) as cache:
+                            rows=cache.execute('SELECT c.id,c.memory_id,c.vector,r.fingerprint FROM chunks c '
+                                'JOIN records r ON r.id=c.memory_id WHERE c.vector IS NOT NULL AND c.embedding_version=?',
+                                (client.model_fingerprint,))
+                            def stored_vectors():
+                                for row in rows:
+                                    groups[row['id']]=row['memory_id']
+                                    evidence[row['id']]=row['fingerprint']
+                                    yield row['id'],row['vector']
+                            index=VectorIndex(stored_vectors())
+                        saved=(index,groups,evidence)
+                        if cache_generation(root)==generation:
+                            with matrix_lock:
+                                matrices[matrix_key]=saved
+                                while len(matrices)>2:matrices.popitem(last=False)
+                    index,groups,evidence=saved
+                    allowed={cid for cid,mid in groups.items() if fingerprints.get(mid)==evidence[cid]}
+                    ranked=[(cid,score) for cid,score in index.top_k(vector,k=max(20,limit),groups=groups,allowed=allowed) if score>=.35]
+                ids=[cid for cid,_ in ranked]
                 if ids:
-                    winners={r['id']:r for r in cache.execute('''SELECT c.id,c.memory_id,c.text,
-                        c.analysis_version,r.fingerprint FROM chunks c
-                        JOIN records r ON r.id=c.memory_id WHERE c.id IN ('''+
-                        ','.join('?' for _ in ids)+')',ids)}
-                    for rank,item in enumerate(ranked):
-                        row=winners.get(item['id'])
-                        if row and row['analysis_version']==cfgversion:add(row,rank,.7)
-            if config['embeddings'] and cache.execute(
-                    'SELECT 1 FROM chunks WHERE vector IS NOT NULL LIMIT 1').fetchone():
-                try:
-                    from ai_embeddings import EmbeddingClient,cosine_top_k
-                    query_config=dict(config,embedding_timeout_seconds=2)
-                    with EmbeddingClient(query_config,root) as client:
-                        client.ensure_ready(allow_launch=False)
-                        vector=client.embed([query],query=True)[0]
-                        rows=cache.execute('''SELECT c.id,c.memory_id,c.vector,r.fingerprint
-                            FROM chunks c JOIN records r ON r.id=c.memory_id
-                            WHERE c.vector IS NOT NULL AND c.embedding_version=?''',
-                            (client.model_fingerprint,))
-                        candidates=((r['id'],json.loads(r['vector'])) for r in rows
-                                    if fingerprints.get(r['memory_id'])==r['fingerprint'])
-                        ranked=[(cid,score) for cid,score in cosine_top_k(vector,candidates,k=20)
-                                if score>=.35]
-                    ids=[cid for cid,_ in ranked]
-                    if ids:
-                        winners={r['id']:r for r in cache.execute('''SELECT c.id,c.memory_id,
-                            c.text,r.fingerprint FROM chunks c JOIN records r ON r.id=c.memory_id
-                            WHERE c.id IN ('''+','.join('?' for _ in ids)+')',ids)}
-                        for rank,(cid,_) in enumerate(ranked):
-                            if cid in winners:add(winners[cid],rank)
-                except Exception:
-                    pass  # No model is necessary for exact source retrieval.
+                    with closing(cache_connect(root)) as cache:
+                        winners={r['id']:r for r in cache.execute('SELECT c.id,c.memory_id,c.text,r.fingerprint FROM chunks c '
+                            'JOIN records r ON r.id=c.memory_id WHERE c.id IN ('+','.join('?' for _ in ids)+')',ids)}
+                    for rank,(cid,_) in enumerate(ranked):
+                        if cid in winners:add(winners[cid],rank,'embedding')
+            except Exception:
+                pass
         result=[value[1] for value in sorted(scored.values(),key=lambda x:-x[0])][:max(limit,6)]
-        # Slow reasoning is reserved for longer questions, never required for short lookups.
         if config['rerank'] and len(query.split())>=7 and len(result)>=3:
             try:result=LocalChat(config).rank(query,result)
             except Exception:pass
         result=result[:limit]
-        if stable_index and index_signature()==snapshot_signature:
+        if cache_generation(root)==generation:
             payload=encoded(result)
             if len(payload)<=65536:
                 with memo_lock:
@@ -633,6 +844,7 @@ def enhance_search(root, db, query, hits, limit, *, release_snapshot=False):
             db.rollback()
 
 
+
 def status(root, db):
     config=load_config(root)
     result=dict(enabled=config['enabled'],embeddings=config['embeddings'],rerank=config['rerank'],
@@ -645,7 +857,8 @@ def status(root, db):
             result.update(indexed_chunks=cache.execute('SELECT count(*) FROM chunks').fetchone()[0],
                 analyzed_chunks=cache.execute('SELECT count(*) FROM chunks WHERE analysis_version=?',(cfgversion,)).fetchone()[0],
                 embedded_chunks=cache.execute('SELECT count(*) FROM chunks WHERE vector IS NOT NULL').fetchone()[0],
-                held_analysis=cache.execute('SELECT count(*) FROM chunks WHERE attempts>=3').fetchone()[0])
+                held_analysis=cache.execute('SELECT count(*) FROM chunks WHERE attempts>=3').fetchone()[0],
+                held_embeddings=cache.execute('SELECT count(*) FROM chunks WHERE embedding_attempts>=3').fetchone()[0])
         last=Path(root)/'.ai-cache'/'last-run.json'
         if last.exists():result['last_pass']=json.loads(last.read_text(encoding='utf-8'))
     except (sqlite3.Error,OSError):result['state']='not_indexed_yet'

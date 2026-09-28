@@ -21,6 +21,8 @@ class SearchTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='threadsatchel-search-synthetic-')
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        import ai_memory
+        self.addCleanup(ai_memory.close_cached_readers,self.root)
         self.path = self.root / 'memory.sqlite3'
         self.db = sqlite3.connect(self.path)
         self.addCleanup(self.db.close)
@@ -153,7 +155,7 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(sum('FROM import_receipts' in s for s in selects), 1)
         self.assertTrue(all(len(h['import_metadata']['provenance']) == 1 for h in records))
 
-    def test_enhancement_dynamic_delegate_failure_and_full_bypass(self):
+    def test_enhancement_dynamic_delegate_failure_and_full_expansion(self):
         original = self.add('one', 'SYNTHETIC amberquartz unchanged original')
         module = ModuleType('ai_memory')
         calls = []
@@ -171,7 +173,7 @@ class SearchTests(unittest.TestCase):
             self.assertEqual(search(self.db, self.root, 'amberquartz')[0]['ai_note'],
                              'synthetic derived note')
             self.assertEqual(search(self.db, self.root, 'amberquartz', full=True), [original])
-            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(calls), 3)
             module.enhance_search = lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionError())
             self.assertEqual(search(self.db, self.root, 'amberquartz')[0]['id'], 'one')
             module.enhance_search = lambda *args, **kwargs: None
