@@ -107,6 +107,10 @@ python memory_ai.py diagnostics --chunk-id <chunk-id>
 
 Processing results include structured diagnostic codes such as `model_token_limit`, `fact_kind_invalid`, and `fact_quote_not_in_source`. The derived cache retains the latest 4,096 diagnostic events, including requested retries, failed attempts, and successful commits. Events contain timestamps, chunk IDs, stages, attempts, stable codes, and allowlisted field/index/count metadata. They do not contain original text, model output, credential values, or exception messages. Strict source-quote and structure validation still applies; requesting a retry does not relax acceptance rules.
 
+Normal background analysis and controlled recovery both use `source-quote-reference-v1`. The program supplies at most eight exact source excerpts with request-local IDs. Qwen returns a `quote_id`, and the program attaches the original excerpt itself. Model-authored quotation fields, unknown IDs, and malformed references are rejected before storage; invalid IDs report `fact_quote_reference_invalid`. The usual source-substring validator still runs afterward. This prevents altered quotations from being accepted, but a model can still misinterpret an exact excerpt. Interpretations remain labeled and linked to their originals.
+
+The generation protocol appears separately in status and processing results. The stored analysis contract remains `qwen-memory-v2`, so previously validated analyses and embeddings are preserved without mass reanalysis or being relabeled as newly generated.
+
 After a diagnosed `fact_quote_not_in_source` failure, an owner can explicitly request a conservative recovery attempt:
 
 ```powershell
@@ -114,7 +118,7 @@ python memory_ai.py retry-held --chunk-id <chunk-id>
 python memory_ai.py process --chunk-id <chunk-id> --recover-analysis --max-chunks 1 --budget-seconds 35
 ```
 
-This selected, queued retry limits output to one fact and supplies at most eight unchanged source snippets, each at most 160 characters, as the only allowed quote choices. Unsupported facts must be omitted. The returned result still passes the ordinary strict validator; quotes are never repaired or invented after generation. The normal prompt, schema, and analysis version stay unchanged. Selected retries update only their successful chunk analysis/search terms; normal source-validating processing refreshes project briefings later. Every briefing also verifies its cited source fingerprints, even when its overall archive generation matches.
+This selected, queued retry limits output to one fact and supplies at most eight unchanged source snippets, each at most 160 characters, referenced by their IDs. Unsupported facts must be omitted. The returned result still passes the ordinary strict validator; quotes are never repaired or invented after generation. Selected retries update only their successful chunk analysis/search terms; normal source-validating processing refreshes project briefings later. Every briefing also verifies its cited source fingerprints, even when its overall archive generation matches.
 
 If chat weights change behind an unchanged model alias, change `chat_model_revision` too; operational batch or timeout tuning does not require reanalysis. An optional `chat_api_key_file` may point to an absolute protected local secret file when the chat server requires authentication. Keep that file out of the repository; its contents are not included in analysis identities or error messages.
 

@@ -172,13 +172,16 @@ class DiagnosticTests(unittest.TestCase):
         with patch.object(chat,'complete',return_value=dict(summary='SYNTHETIC',keywords=[],questions=[],facts=[])) as complete:
             chat.analyze({'text':text,'_quote_recovery':True},'general')
             content=complete.call_args.args[1];schema=complete.call_args.kwargs['response_schema']
-            self.assertEqual(content['quote_choices'],choices)
+            self.assertEqual(content['quote_choices'],{'q'+str(i):quote for i,quote in enumerate(choices)})
             self.assertEqual(schema['properties']['facts']['maxItems'],1)
-            self.assertEqual(schema['properties']['facts']['items']['properties']['quote']['enum'],choices)
+            self.assertEqual(schema['properties']['facts']['items']['properties']['quote_id']['enum'],list(content['quote_choices']))
+            self.assertNotIn('quote',schema['properties']['facts']['items']['properties'])
             self.assertEqual(complete.call_args.kwargs['max_tokens'],650)
             chat.analyze({'text':text},'general')
-            self.assertNotIn('quote_choices',complete.call_args.args[1])
-            self.assertEqual(complete.call_args.kwargs['response_schema'],unchanged)
+            self.assertEqual(complete.call_args.args[1]['quote_choices'],content['quote_choices'])
+            normal=complete.call_args.kwargs['response_schema']
+            self.assertEqual(normal['properties']['facts']['maxItems'],4)
+            self.assertNotIn('quote',normal['properties']['facts']['items']['properties'])
         self.assertEqual(ai.ANALYSIS_SCHEMA,unchanged)
         raw=dict(summary='SYNTHETIC',keywords=[],questions=[],facts=[dict(subject='robot',key='part',value='one',kind='observed',quote='NOT IN SYNTHETIC SOURCE')])
         with self.assertRaises(ai.AnalysisFailure) as error:ai.validate_analysis(raw,{'text':text})
@@ -205,6 +208,29 @@ class DiagnosticTests(unittest.TestCase):
         with closing(ai.archive_connect(self.root)) as source:
             result=ai.project_brief(self.root,source,'general')
         self.assertFalse(result['generated']);self.assertEqual(result['state'],'pending')
+
+    def test_actual_normal_chat_path_rejects_invalid_reference_before_commit(self):
+        with closing(ai.cache_connect(self.root,True)) as cache,cache:
+            cache.execute("UPDATE chunks SET attempts=0,error=NULL WHERE memory_id='one'")
+            vector=cache.execute("SELECT vector FROM chunks WHERE memory_id='one'").fetchone()[0]
+        before=hashlib.sha256((self.root/'memory.sqlite3').read_bytes()).digest()
+        raw=dict(summary='SYNTHETIC rejected interpretation',keywords=[],questions=[],facts=[
+            dict(subject='robot',key='part',value='one',kind='observed',quote_id='SYNTHETIC_PRIVATE_BAD_REFERENCE')])
+        chat=ai.LocalChat(self.config)
+        with patch.object(chat,'available',return_value=True),patch.object(chat,'complete',return_value=raw) as complete:
+            report=ai.process(self.root,max_records=1,budget_seconds=20,chat_client=chat)
+        complete.assert_called_once()
+        self.assertEqual(report['analyzed_chunks'],0)
+        self.assertEqual(report['generation_protocol'],ai.GENERATION_PROTOCOL)
+        self.assertEqual(ai.status(self.root,None)['generation_protocol'],ai.GENERATION_PROTOCOL)
+        self.assertEqual(report['diagnostics'][0]['code'],'fact_quote_reference_invalid')
+        self.assertNotIn('SYNTHETIC_PRIVATE_BAD_REFERENCE',json.dumps(report))
+        with closing(ai.cache_connect(self.root)) as cache:
+            row=cache.execute("SELECT analysis,attempts,error,vector FROM chunks WHERE memory_id='one'").fetchone()
+            self.assertIsNone(row['analysis']);self.assertEqual(row['attempts'],1)
+            self.assertEqual(row['error'],'ValueError');self.assertEqual(row['vector'],vector)
+            self.assertEqual(cache.execute('SELECT count(*) FROM aids_fts').fetchone()[0],0)
+        self.assertEqual(hashlib.sha256((self.root/'memory.sqlite3').read_bytes()).digest(),before)
 
 
 if __name__=='__main__':unittest.main()
