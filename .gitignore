@@ -24,3 +24,8 @@ test-result.json
 *.key
 id_*
 known_hosts*
+memory-ai.json
+.ai-cache/
+models/
+*.gguf
+*-evaluation.json

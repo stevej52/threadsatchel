@@ -4,11 +4,11 @@ The software stores private information. The public repository contains code and
 
 ## What leaves a computer
 
-Local import/search/capture uses SQLite and Python; it makes no model/API calls. Multi-machine sync sends filtered packet text over your configured SSH connection. When an AI client asks an MCP tool for memories, the returned text enters that client's context and is subject to that client's handling. "Local storage" does not mean that an external model never sees retrieved text.
+Default local import/search/capture uses SQLite and Python; it makes no model/API calls. The optional Qwen layer sends selected text only to validated literal loopback model endpoints, with proxies and redirects disabled. Downloading model weights requires Internet access during setup; processing memories does not. Multi-machine sync sends filtered packet text over your configured SSH connection. When an AI client asks an MCP tool for memories, the returned text enters that client's context and is subject to that client's handling. "Local storage" does not mean that an external model never sees retrieved text.
 
 ## What is retained
 
-Imports preserve original input bytes, including a whole supplied ZIP, plus parsed searchable text, provenance, and revisions. Credential filtering applies to the Codex capture projector, not general manual imports. An export can include sensitive material in its retained original even when the parser does not index it. Review what you import.
+Imports preserve original input bytes, including a whole supplied ZIP, plus parsed searchable text, provenance, and revisions. The optional AI cache contains additional plaintext excerpts, vectors and generated interpretations; it is private disposable data, excluded from Git. Credential filtering applies to the Codex capture projector, not general manual imports. An export can include sensitive material in its retained original even when the parser does not index it. Review what you import.
 
 The database, raw imported objects, queues, and backups are plaintext. Protect them with appropriate filesystem access and disk encryption. SSH protects transport, not data at rest. This project has no built-in authentication, encryption, retention policy, deletion UI, or automatic backup schedule.
 

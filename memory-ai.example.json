@@ -1,0 +1,17 @@
+{
+  "enabled": false,
+  "embeddings": true,
+  "rerank": true,
+  "endpoint": "http://127.0.0.1:8090",
+  "model": "Qwen2.5-14B-Instruct",
+  "chat_timeout_seconds": 25,
+  "projects": {},
+  "include_unassigned": true,
+  "embedding_endpoint": "http://127.0.0.1:8091",
+  "embedding_model_path": "C:/Models/Qwen3-Embedding-0.6B-Q8_0.gguf",
+  "llama_server_path": "C:/Tools/llama.cpp/llama-server.exe",
+  "embedding_threads": 4,
+  "embedding_timeout_seconds": 20,
+  "max_chunks_per_pass": 6,
+  "budget_seconds": 90
+}

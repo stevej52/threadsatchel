@@ -2,10 +2,10 @@
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
-import re
 import sqlite3
 from uuid import uuid4
 from import_metadata import enrich
+from memory_search import search
 
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
@@ -44,18 +44,10 @@ def store_memory(text: str, source: str, optional_title: str | None = None) -> d
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
-def search_memory(query: str) -> list[dict]:
-    """Search SQLite FTS5 using literal words (OR), ranked by BM25; return up to 20 full records."""
-    terms = list(dict.fromkeys(re.findall(r'[^\W_]+', query, flags=re.UNICODE)))
-    if not terms:
-        return []
-    expression = ' OR '.join('"' + term + '"' for term in terms)
+def search_memory(query: str, limit: int = 20, full: bool = False) -> list[dict]:
+    """Search compact matching excerpts (limit 1..20); full=True returns exact text and provenance."""
     with closing(connect()) as db:
-        rows = db.execute('''SELECT m.* FROM memory_fts
-            JOIN memories AS m ON m.id=memory_fts.id
-            WHERE memory_fts MATCH ? ORDER BY bm25(memory_fts), m.created_at DESC LIMIT 20''',
-            (expression,)).fetchall()
-        return [enrich(db, row) for row in rows]
+        return search(db, Path(DB).parent, query, limit=limit, full=full)
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
@@ -66,6 +58,22 @@ def get_memory(id: str) -> dict:
         if row is None:
             raise ValueError('Memory ID not found')
         return enrich(db, row)
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+def get_project_brief(project: str) -> dict:
+    """Read an optional local project brief with source references and freshness metadata."""
+    from ai_memory import project_brief
+    with closing(connect()) as db:
+        return project_brief(Path(DB).parent, db, project)
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+def memory_ai_status() -> dict:
+    """Report the optional local AI layer's configuration and current index status."""
+    from ai_memory import status
+    with closing(connect()) as db:
+        return status(Path(DB).parent, db)
 
 
 if __name__ == '__main__':

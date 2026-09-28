@@ -1,0 +1,2 @@
+# Optional CPU ranking acceleration. Core memory and local embeddings work without it.
+numpy>=2.0,<3

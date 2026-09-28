@@ -15,6 +15,8 @@ A small, local memory archive that AI assistants can search through MCP. Keep or
 - Can queue capture on several machines and pull it into one archive over existing SSH connections.
 - Makes repeated imports safe and conservatively reconciles overlapping excerpts.
 - Optionally imports completed inbox files every two minutes using the same importer.
+- Returns compact search excerpts, with full originals available by ID or `full=True`.
+- Optionally adds local Qwen semantic search, evidence-linked interpretations and cached project briefings. This feature is off unless you enable it; the normal installation needs no model or special hardware.
 
 ## Start here
 
@@ -50,6 +52,8 @@ python install_schedule.py inbox
 Write a temporary `.incoming-<id>.json.part` file inside `inbox/`, then rename it to a new final `.json` filename after the write is complete. The sweep imports completed JSON, TXT, and Markdown files, retains originals and failures, skips existing import receipts, and records its results locally. See [inbox delivery and scheduling](docs/INBOX_SWEEP.md).
 
 ## How it fits together
+
+This branch includes an [optional Qwen layer](docs/OPTIONAL_QWEN.md), with explicit on/off commands. Its disposable derived index never replaces the original archive or importer. Model weights and optional acceleration dependencies are installed separately; existing capture and inbox delivery continue to work with AI off.
 
 ```mermaid
 flowchart TD

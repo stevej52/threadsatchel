@@ -2,7 +2,9 @@
 
 ## Read path
 
-server_readonly.py exposes search_memory and get_memory over stdio MCP. Search tokenizes literal words, combines them with OR, ranks SQLite FTS5 results by BM25, and returns up to 20 complete records. This is lexical retrieval, not embeddings or semantic search. get_memory returns original text by ID. import_metadata.py adds revision/provenance information when available.
+server_readonly.py exposes search_memory and get_memory over stdio MCP. memory_search.py prioritizes exact IDs, phrases and all-word matches before an OR fallback, using SQLite FTS5. Search returns up to 20 compact excerpts by default; full=True returns complete records and batched provenance. get_memory always returns original text by ID.
+
+The optional ai_memory.py layer reads the archive without modifying it. A separate disposable .ai-cache/index.sqlite3 holds chunk embeddings, validated source quotes, model interpretations, generated search questions and cached project briefs. ai_embeddings.py uses a separately installed local Qwen embedding model. Existing local chat inference supplies bounded extraction and selective reranking. get_project_brief and memory_ai_status expose cached evidence and coverage; memory_ai.py supplies explicit on/off controls and optional limited-user background processing. All AI features default off, and lexical retrieval remains available when models fail. See OPTIONAL_QWEN.md.
 
 ## Write path
 

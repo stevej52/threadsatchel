@@ -29,7 +29,7 @@ class DirectDeliveryTests(unittest.TestCase):
         self.inbox = self.root / 'inbox'
         self.inbox.mkdir()
         shutil.copy2(ROOT / 'import_memory.py', self.root / 'import_memory.py')
-        for name in ('server_readonly.py', 'import_metadata.py'):
+        for name in ('server_readonly.py', 'import_metadata.py', 'memory_search.py', 'ai_memory.py'):
             shutil.copy2(SOURCE / name, self.root / name)
         with closing(sqlite3.connect(self.root / 'memory.sqlite3')) as db, db:
             db.execute('CREATE TABLE memories(id TEXT PRIMARY KEY,text TEXT NOT NULL,source TEXT NOT NULL,title TEXT,created_at TEXT NOT NULL)')
