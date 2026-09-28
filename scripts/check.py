@@ -4,7 +4,7 @@ import subprocess,sys
 root=Path(__file__).resolve().parent.parent
 checks=[['-m','unittest','test_codex_capture','test_capture_limits','test_store_memory',
          'test_direct_delivery','test_inbox_sweep','test_import_limits','test_import_identity_performance',
-         'test_memory_search','test_ai_embeddings','test_ai_quality','test_ai_chat','test_ai_remediation'],
+         'test_memory_search','test_ai_embeddings','test_ai_quality','test_ai_chat','test_ai_remediation','test_ai_diagnostics'],
         ['test_capture_export.py'],['test_incremental.py'],
         ['test_reconcile_imports.py'],['test_export_overlap.py'],['test_sync_capture.py']]
 for args in checks:
