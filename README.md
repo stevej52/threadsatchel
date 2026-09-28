@@ -24,6 +24,12 @@ Start with the **[complete Qwen installation guide](https://github.com/stevej52/
 
 ## Start here
 
+> **ChatGPT users: required setup step**
+>
+> ThreadSatchel does **not** automatically save ordinary ChatGPT conversations merely because the MCP server is connected. After connecting ThreadSatchel, copy the [recommended standing instructions](docs/STANDING_INSTRUCTIONS.md) into ChatGPT's Custom Instructions (or equivalent standing-instructions field) and replace the path placeholders for your installation. **If you skip this step, ChatGPT can search existing ThreadSatchel memory, but new ordinary ChatGPT turns will not be reliably delivered to the archive.**
+>
+> Codex is different: supported local Codex capture can run outside the model. See [capture and multi-machine setup](docs/CAPTURE.md).
+
 Requires Python 3.12+ with SQLite FTS5. The tested MCP dependency is pinned in requirements.txt.
 
 ```sh
@@ -34,7 +40,7 @@ python setup_memory.py
 python import_memory.py examples/example-excerpt.json
 ```
 
-Connect your MCP client to the absolute path of `.venv`'s Python executable, with the absolute path of `server_readonly.py` as its argument. Ask it to search for **sample archive** to check the example import. See [connection instructions](docs/CONNECTING.md), including Codex configuration. For ordinary ChatGPT or other model-driven clients, also install the [recommended standing instructions](docs/STANDING_INSTRUCTIONS.md); without client-side capture, MCP access alone does not automatically save completed chat turns.
+Connect your MCP client to the absolute path of `.venv`'s Python executable, with the absolute path of `server_readonly.py` as its argument. Ask it to search for **sample archive** to check the example import. See [connection instructions](docs/CONNECTING.md), including Codex configuration.
 
 For optional automatic local capture:
 
