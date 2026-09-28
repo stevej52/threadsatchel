@@ -10,7 +10,7 @@ The checked-in [`memory-ai.example.json`](../memory-ai.example.json) is a disabl
 
 ## Local inference
 
-The supported arrangement uses an OpenAI-compatible local chat endpoint and an optional local embedding endpoint:
+The supported arrangement uses a local llama.cpp chat server with its OpenAI-compatible endpoint and `/slots` availability check, plus an optional local embedding endpoint:
 
 | Purpose | Example local service | Role |
 | --- | --- | --- |
@@ -18,6 +18,10 @@ The supported arrangement uses an OpenAI-compatible local chat endpoint and an o
 | Semantic retrieval, optional | Qwen3-Embedding-0.6B on CPU, `http://127.0.0.1:8091` | Match related wording even when the exact words differ. |
 
 These are separate services. The chat model is not used as a substitute for an embedding model. A 4096-token chat context requires bounded source chunks; a long conversation is not silently treated as if it fit in one request. Processing reports indicate incomplete coverage.
+
+Extraction requires the nested OpenAI `json_schema` response format supported by the tested llama.cpp build b11188-e85e15cf6. The grammar constrains output structure; a separate check still requires every quoted fact to match its original passage. Neither check proves that an interpretation is correct. Unsupported services leave extraction pending and preserve ordinary retrieval.
+
+Exact IDs, part numbers and strong short literal matches take the fast lexical path even when AI is enabled. Longer questions and related wording can use semantic search and selective reranking, which add latency. Repeated derived queries have a bounded in-process cache; precomputed briefs do not call the chat model during retrieval.
 
 Use local model files such as `<models>/your-model.gguf` and your own server executable. Model installation and service startup are separate from enabling archive processing. Runtime inference stays on loopback; no external model API, paid key, or cloud fallback is used. If the local service is unavailable, original-record retrieval and ordinary lexical search remain available.
 

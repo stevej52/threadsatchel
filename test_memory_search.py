@@ -240,6 +240,21 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(before, hashlib.sha256(index_path.read_bytes()).hexdigest())
         self.assertFalse(self.db.in_transaction)
 
+    def test_enabled_literal_lookups_skip_model_and_archive_scan(self):
+        import ai_memory
+        config=dict(ai_memory.DEFAULTS,enabled=True)
+        (self.root/'memory-ai.json').write_text(json.dumps(config),encoding='utf-8')
+        for n in range(3):
+            self.add('robot'+str(n),'SYNTHETIC robot controller XM430-W350-R '+str(n))
+        with patch.object(ai_memory,'current_sources',side_effect=AssertionError('unnecessary archive scan')) as scan, \
+             patch.object(ai_memory,'cache_connect',side_effect=AssertionError('unnecessary AI cache')) as cache:
+            self.assertEqual(len(search(self.db,self.root,'robot controller',limit=3)),3)
+            self.assertEqual(search(self.db,self.root,'robot0')[0]['id'],'robot0')
+            self.assertEqual(len(search(self.db,self.root,'XM430-W350-R')),3)
+            scan.assert_not_called()
+            cache.assert_not_called()
+        self.assertFalse(self.db.in_transaction)
+
     def test_query_cache_invalidates_changed_source_and_derived_index(self):
         ai_memory = self.prepare_derived_index()
         with patch.object(ai_memory.LocalChat, 'rank', lambda _client, query, hits: hits):
