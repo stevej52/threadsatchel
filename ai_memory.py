@@ -312,10 +312,13 @@ def process(root, max_records=6, budget_seconds=90, chat_client=None, embedding_
                     embedding_client=None
             ev=embedding_client.model_fingerprint if embedding_client else ''
             # Failed interpretations get at most three attempts, then stay visible for review.
-            rows=cache.execute('''SELECT c.*,r.project FROM chunks c JOIN records r ON r.id=c.memory_id
+            rows=cache.execute('''SELECT * FROM (
+                SELECT c.*,r.project,ROW_NUMBER() OVER (
+                    PARTITION BY r.project ORDER BY c.created_at DESC,c.memory_id,c.part
+                ) AS project_position FROM chunks c JOIN records r ON r.id=c.memory_id
                 WHERE (?=0 AND coalesce(analysis_version,'')!=? AND attempts<3)
                 OR (?!='' AND coalesce(embedding_version,'')!=?)
-                ORDER BY created_at DESC,memory_id,part LIMIT ?''',
+                ) ORDER BY project_position,project LIMIT ?''',
                 (int(embeddings_only),cfgversion,ev,ev,max(1,min(int(max_records),100)))).fetchall()
             for row in rows:
                 if time.monotonic()-started>budget_seconds or not load_config(root)['enabled']:

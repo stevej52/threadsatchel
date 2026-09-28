@@ -39,6 +39,8 @@ python memory_ai.py off
 
 Enabling is a local choice, not a repository default. The settings live in `memory-ai.json`, which is excluded from Git. `off` disables subsequent AI work; an already running chunk may finish. It preserves original memories and the disposable cache. Use `status` to inspect whether the feature is enabled, processing counts, and the latest pass report before relying on derived results. `process` performs a bounded pass; repeat it to continue indexing.
 
+Reconnect an already-running MCP client after installing this branch so it loads the updated server and discovers `get_project_brief` and `memory_ai_status`. Subsequent on/off changes are read dynamically. With scheduling installed, re-enabling starts background work at the next scheduled pass, within five minutes.
+
 Configure project terms in your local `memory-ai.json`. For example, these fields select two synthetic projects and leave other records out of optional processing:
 
 ```json
@@ -60,6 +62,8 @@ To start the configured CPU embedding service manually, run `python memory_ai.py
 To change embedding model paths or worker settings, disable AI, allow the current owner to exit, edit the configuration, then enable AI and start the owner again. The running owner keeps its startup configuration.
 
 Background processing is optional. It runs bounded passes at idle priority so foreground work takes precedence. The processor checks that the chat service is idle before starting inference; a request already in flight is allowed to finish. It does not stop or restart the chat service used by another application.
+
+Passes alternate between configured projects so a stream of recent messages in one project does not take every analysis slot. Work within each project is ordered newest first. Initial indexing is incremental; inspect coverage rather than assuming the whole archive has been processed.
 
 After a manual bounded pass succeeds, Windows users can opt into the schedule with `python memory_ai.py install-schedule`. This installs ordinary user tasks for processing and the embedding service owner every five minutes, with overlapping runs suppressed. Existing tasks are not silently replaced. Disabling AI is sufficient to prevent new scheduled passes from calling a model. Other systems can invoke the same commands through their user scheduler.
 

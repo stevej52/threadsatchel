@@ -233,6 +233,28 @@ class OptionalAIIntegrationTests(unittest.TestCase):
             self.assertEqual(client.calls, [])
         self.assertFalse((self.root / ".ai-cache").exists())
 
+    def test_bounded_pass_shares_analysis_and_embeddings_between_projects(self):
+        with closing(sqlite3.connect(self.db_path)) as db, db:
+            db.execute("UPDATE memories SET created_at=CASE WHEN title='SYNTHETIC Atlas' THEN '2030-01-01' ELSE '2020-01-01' END")
+        self.config["embeddings"] = True
+        self.write_config()
+
+        class SyntheticEmbeddings:
+            model_fingerprint = "synthetic-project-fairness-v1"
+
+            def embed(self, texts, query=False):
+                return [[1.0, 0.0] for _ in texts]
+
+        report = ai_memory.process(self.root, max_records=2, budget_seconds=20,
+            chat_client=SyntheticChat(), embedding_client=SyntheticEmbeddings())
+        self.assertEqual(report["analyzed_chunks"], 2)
+        self.assertEqual(report["embedded_chunks"], 2)
+        with closing(sqlite3.connect(self.root / ".ai-cache" / "index.sqlite3")) as cache:
+            for field in ("analysis", "vector"):
+                projects = {row[0] for row in cache.execute(
+                    "SELECT DISTINCT r.project FROM chunks c JOIN records r ON r.id=c.memory_id WHERE c." + field + " IS NOT NULL")}
+                self.assertEqual(projects, {"Atlas", "Borealis"})
+
     def test_qwen_unavailable_preserves_canonical_archive(self):
         with patch("socket.socket", side_effect=AssertionError("Synthetic tests cannot use network")):
             report = self.process(SyntheticChat(available=False))
