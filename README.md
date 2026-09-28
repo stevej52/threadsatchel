@@ -6,6 +6,12 @@ A small, local memory archive that AI assistants can search through MCP. Keep or
 
 **Early release.** Built and exercised on Windows, with a Linux capture node. It is a personal tool made shareable, not a hosted service or a promise to capture every chat automatically.
 
+## Optional Qwen helper
+
+Want local AI assistance with finding and reviewing your archive? The separate **[optional Qwen branch](https://github.com/stevej52/threadsatchel/tree/feature/optional-qwen-memory)** adds semantic search, source-linked interpretations, project briefs, and bounded CPU/RAM caching and background work. **Main stays model-free, and Qwen is off by default even on the optional branch.**
+
+Start with the **[complete Qwen installation guide](https://github.com/stevej52/threadsatchel/blob/feature/optional-qwen-memory/docs/QWEN_INSTALL.md)** for requirements, pinned model/runtime downloads, checksums, startup commands, verification, and the on/off switch. The reference setup uses llama.cpp with Qwen2.5-14B chat inference plus a separate small Qwen3 CPU embedding model; optional NumPy accelerates vector ranking. Qwen's weights were not modified. GPU/RAM needs, tested hardware, privacy, and current limitations are documented there.
+
 ## What it does
 
 - Exposes `search_memory` and `get_memory` through a read-only MCP server.
