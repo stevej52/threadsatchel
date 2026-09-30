@@ -2,7 +2,9 @@
 
 ## Read path
 
-server_readonly.py exposes search_memory and get_memory over stdio MCP. Search tokenizes literal words, combines them with OR, ranks SQLite FTS5 results by BM25, and returns up to 20 complete records. This is lexical retrieval, not embeddings or semantic search. get_memory returns original text by ID. import_metadata.py adds revision/provenance information when available.
+server_readonly.py exposes search_memory, list_memories, and get_memory over stdio MCP. memory_search.py uses exact-ID lookup, phrase/all-word matching, then literal OR fallback with SQLite FTS5/BM25 ranking. Search returns compact excerpts by default (20 results, maximum 100); full=True expands the same selected IDs. get_memory returns exact original text and provenance. import_metadata.py batches identity/provenance reads. Main remains model-free.
+
+memory_listing.py performs read-only keyset pagination in stable ID order, with bounded previews and an initial rowid boundary. It checks the membership fingerprint on each page: append-only arrivals join a later scan; removal/replacement fails explicitly. Counts refer to original records including retained revisions. This fixes scan membership, not mutable contents across calls. Full text remains available by ID.
 
 ## Write path
 
@@ -22,7 +24,11 @@ inbox_sweep.py performs one bounded pass over finalized files directly inside in
 
 ## Formats and compatibility
 
-The database is a local SQLite file with FTS5. MCP is pinned to the version tested by the original deployment. Python 3.12+ is the documented target. Capture relies on observed Codex JSONL structures; unsupported formats are counted/omitted rather than guessed. Real full ChatGPT ZIP validation is pending. Claude text can be supplied as threadsatchel/1 excerpts, but no native Claude export adapter is included.
+The database is a local SQLite file with FTS5. MCP is pinned to the version tested by the original deployment. Python 3.12+ is the documented target. Capture relies on observed Codex JSONL structures; unsupported formats are counted/omitted rather than guessed. A full real OpenAI conversation export was successfully imported, including numbered parts and supplied voice transcripts. Claude material is successfully imported as threadsatchel/1 packets; no native arbitrary Claude export adapter is included. See IMPORTING.md for verified scope and limits.
+
+## Personal plugin path
+
+The local server can be wrapped in a user-created desktop plugin or connected through an appropriate transport. The author's private Site gateway and outbound connector have been used with Dot and appear to work well. The public repository documents how users build their own instance in CREATE_YOUR_OWN_PLUGIN.md and PRIVATE_GATEWAY.md. Gateway hosting, authentication, remote operation queues, and importer-backed save_memory belong to that separately built integration.
 
 ## Validation
 

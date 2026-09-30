@@ -1,9 +1,10 @@
 """Read-only stdio MCP entry point for the existing ThreadSatchel database."""
 from contextlib import closing
 from pathlib import Path
-import re
 import sqlite3
 from import_metadata import enrich
+from memory_search import search
+from memory_listing import list_records
 
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
@@ -22,19 +23,17 @@ def connect():
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
-def search_memory(query: str) -> list[dict]:
-    """Search literal words in existing memories; return up to 20 complete records."""
-    terms = list(dict.fromkeys(re.findall(r'[^\W_]+', query, flags=re.UNICODE)))
-    if not terms:
-        return []
-    expression = ' OR '.join('"' + term + '"' for term in terms)
+def search_memory(query: str, limit: int = 20, full: bool = False) -> list[dict]:
+    """Search ranked excerpts (default 20, maximum 100); full=True expands the same results to original text and provenance."""
     with closing(connect()) as db:
-        rows = db.execute('''SELECT m.* FROM memory_fts
-            JOIN memories AS m ON m.id=memory_fts.id
-            WHERE memory_fts MATCH ? ORDER BY bm25(memory_fts), m.created_at DESC LIMIT 20''',
-            (expression,)).fetchall()
-        return [enrich(db, row) for row in rows]
+        return search(db, Path(DB).parent, query, limit=limit, full=full)
 
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+def list_memories(limit: int = 100, cursor: str | None = None) -> dict:
+    """List all original records in pages of 1..100 previews, independent of search. Follow next_cursor until null; total_count counts records, not AI chunks. Use get_memory(id) for full text. New arrivals join the next scan."""
+    with closing(connect()) as db:
+        return list_records(db, limit=limit, cursor=cursor)
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
 def get_memory(id: str) -> dict:

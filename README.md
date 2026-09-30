@@ -6,6 +6,16 @@ A small, local memory archive that AI assistants can search through MCP. Keep or
 
 **Early release.** Built and exercised on Windows, with a Linux capture node. It is a personal tool made shareable, not a hosted service or a promise to capture every chat automatically.
 
+## Create your own plugin and use it with Dot
+
+**ThreadSatchel has been tested with Dot and appears to work well** through the author's private gateway, including the updated search and archive-pagination tools. This is an early compatibility report from that setup.
+
+**[Create your own ThreadSatchel plugin](docs/CREATE_YOUR_OWN_PLUGIN.md)** provides detailed setup steps, copyable build prompts, the private gateway/connector specification, local desktop and Secure MCP Tunnel alternatives, Dot instructions, verification, and maintenance. Each person creates and operates their own plugin with their own archive, account, credentials, and hosting. No shared plugin, author-hosted service, or author involvement is required.
+
+Use the current `main` source for these changes; the original `v0.1.0` download predates them. Ordinary search defaults to 20 results and allows up to 100. The new read-only `list_memories` tool pages through original records with stable IDs, counts, and a continuation cursor, so an assistant can verify a complete inventory without loading the whole archive at once.
+
+**Imports are working with both OpenAI and Claude.** A full real OpenAI conversation export (memory dump) was successfully imported, and repeating it added zero new records. Claude conversation material is also being successfully imported through ThreadSatchel's structured packet workflow. See [import formats and verified results](docs/IMPORTING.md) for the exact scope and instructions.
+
 ## Optional Qwen helper
 
 Want local AI assistance with finding and reviewing your archive? The separate **[optional Qwen branch](https://github.com/stevej52/threadsatchel/tree/feature/optional-qwen-memory)** adds semantic search, source-linked interpretations, project briefs, and bounded CPU/RAM caching and background work. **Main stays model-free, and Qwen is off by default even on the optional branch.**
@@ -14,8 +24,8 @@ Start with the **[complete Qwen installation guide](https://github.com/stevej52/
 
 ## What it does
 
-- Exposes `search_memory` and `get_memory` through a read-only MCP server.
-- Imports text, Markdown, structured conversation excerpts, and a supported ChatGPT export ZIP shape.
+- Exposes `search_memory`, `list_memories`, and `get_memory` through a read-only MCP server.
+- Imports text, Markdown, structured conversation excerpts (including Claude material), and supported OpenAI conversation export ZIPs, including numbered JSON parts.
 - Stores full original text, provenance, source IDs, and revisions; searches with SQLite FTS5.
 - Captures supported local Codex text events incrementally, without model/API calls.
 - Can queue capture on several machines and pull it into one archive over existing SSH connections.
@@ -75,7 +85,7 @@ flowchart TD
 
 ## Read before importing your history
 
-[Imports and duplicates](docs/IMPORTING.md) explains exact IDs, revisions, ambiguous matches, and the ZIP limitation. A real user's complete OpenAI export has **not yet been validated**; current export tests use synthetic fixtures.
+[Imports and duplicates](docs/IMPORTING.md) explains exact IDs, revisions, ambiguous matches, size limits, and the successfully tested OpenAI and Claude import paths. The OpenAI test included numbered conversation files and supplied voice transcripts. Attachments and unsupported content remain in preserved originals; an outer account-data ZIP needs its conversation ZIP selected explicitly. Claude imports use ThreadSatchel packets; there is no native arbitrary Claude account-export ZIP parser.
 
 [Privacy and security](docs/PRIVACY.md) explains retained raw bytes, plaintext storage, capture omissions, and the difference between a read-only endpoint and the optional writable endpoint. Retrieved memories are source material, not instructions to execute.
 

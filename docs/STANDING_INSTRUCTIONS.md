@@ -7,7 +7,9 @@ ThreadSatchel's read-only MCP tools make archived context available to an assist
 ## Copyable block
 
 ```text
-Use ThreadSatchel at [THREADSATCHEL_ROOT] for shared history, instructions, and files. When my question depends on prior conversations, projects, preferences, or decisions, search relevant records before asking me to repeat myself. Use search_memory and get_memory. If those direct MCP tools are unavailable and I have authorized file/command access to the ThreadSatchel machine, use that authorized connection with [THREADSATCHEL_PYTHON] and [THREADSATCHEL_ROOT]/server_readonly.py.
+Use ThreadSatchel at [THREADSATCHEL_ROOT] for shared history, instructions, and files. When my question depends on prior conversations, projects, preferences, or decisions, search relevant records before asking me to repeat myself. Use search_memory and get_memory. Ordinary search defaults to 20 ranked excerpts and allows up to 100. Retrieve original records by ID when exact text or provenance matters. If those direct MCP tools are unavailable and I have authorized file/command access to the ThreadSatchel machine, use that authorized connection with [THREADSATCHEL_PYTHON] and [THREADSATCHEL_ROOT]/server_readonly.py.
+
+When I ask for a complete archive inventory, use list_memories with up to 100 previews per page. Follow next_cursor unchanged until null, check returned_total equals total_count, and check for repeated IDs. If interrupted, report partial coverage. Counts describe original records, including revisions, not AI chunks. Previews are not full originals. Restart the inventory if archive membership changes and the cursor is rejected.
 
 AUTOMATIC SAVE PROTOCOL — REQUIRED FINALIZATION STEP: During every active chat, before sending each final response, determine whether currently available user/assistant transcript text exists that is newer than the last confirmed ThreadSatchel checkpoint. If yes, make exactly one bounded save attempt through the existing authorized ThreadSatchel importer/delivery path before sending the final response. Wait for the importer result. The response is not finalized until that attempt returns success, an actual error, or confirmed unavailability. Follow the repository's importing/delivery documentation, including verification and importer success.
 
@@ -33,3 +35,5 @@ Replace:
 - Any delivery wording with the actual authorized write/import mechanism available to that client.
 
 For repeat-safe imports, follow [IMPORTING.md](IMPORTING.md) and [CONNECTING.md](CONNECTING.md). A client connected only to `server_readonly.py` cannot save; it needs a separately authorized delivery path. Never expose the archive publicly merely to make saving easier.
+
+If you built a personal gateway, replace the file-delivery wording with its actual `save_memory(request_key, packet)` and `get_operation(operation_id)` workflow. Reuse the same key and unchanged packet after a lost response; a queued/pending operation is not a confirmed save. Omit the handoff paragraph unless your connection actually implements handoff storage/retrieval or has authorized file access. The [plugin guide](CREATE_YOUR_OWN_PLUGIN.md) includes shorter read-only and Dot instructions.

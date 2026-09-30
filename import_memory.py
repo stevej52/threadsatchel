@@ -6,12 +6,32 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import re
 import sqlite3
 from uuid import uuid4
 import zipfile
 
 ROOT = Path(__file__).resolve().parent
 KINDS = {'excerpt', 'summary', 'note'}
+MAX_FILE_BYTES = 32 * 1024 * 1024
+MAX_EXPANDED_BYTES = 128 * 1024 * 1024
+MAX_ZIP_MEMBERS = 10000
+ABSOLUTE_MAX_BYTES = 1024 * 1024 * 1024
+
+
+def validate_limits(max_file_bytes, max_expanded_bytes, max_zip_members):
+    for value in (max_file_bytes, max_expanded_bytes):
+        if type(value) is not int or not 1 <= value <= ABSOLUTE_MAX_BYTES:
+            raise ValueError('Import byte limits must be between 1 byte and 1 GiB')
+    if type(max_zip_members) is not int or not 1 <= max_zip_members <= 100000:
+        raise ValueError('ZIP member limit must be between 1 and 100000')
+
+
+def read_bounded(stream, limit, label):
+    raw = stream.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError(label + ' exceeds configured size limit; use an explicit larger allowance after review')
+    return raw
 
 def is_temporary_file(path):
     """Reserved direct-drop names are never importer inputs, even explicitly."""
@@ -48,7 +68,8 @@ def migrate(db_path):
         if db.execute("SELECT 1 FROM sqlite_master WHERE name='import_schema'").fetchone():
             if db.execute('SELECT version FROM import_schema').fetchall() != [(1,)]:
                 raise ValueError('Unsupported importer schema version')
-            return None
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='import_items_memory'").fetchone():
+                return None
         if not db.execute("SELECT 1 FROM sqlite_master WHERE name='memories'").fetchone():
             raise ValueError('Expected the existing ThreadSatchel database')
         backups = db_path.parent / 'backups'
@@ -64,6 +85,7 @@ def migrate(db_path):
                 for statement in SCHEMA.split(';'):
                     if statement.strip():
                         db.execute(statement)
+            db.execute('CREATE INDEX IF NOT EXISTS import_items_memory ON import_items(memory_id,packet_key)')
             db.commit()
         except Exception:
             db.rollback()
@@ -118,16 +140,53 @@ def source_time(value):
         return value
     raise ValueError('Unsupported export timestamp')
 
-def export_packets(raw, account_id=None):
-    """Known conversations.json graph shape; real-user ZIP validation is pending."""
+def export_packets(raw, account_id=None, *, max_expanded_bytes=MAX_EXPANDED_BYTES,
+                   max_zip_members=MAX_ZIP_MEMBERS):
+    """Parse the conversation graph from one legacy file or numbered JSON parts."""
+    validate_limits(MAX_FILE_BYTES, max_expanded_bytes, max_zip_members)
     warnings = []
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-        names = [n for n in archive.namelist() if n.replace('\\', '/').split('/')[-1] == 'conversations.json']
-        if len(names) != 1:
-            raise ValueError('ZIP must contain exactly one conversations.json')
-        conversations = json.loads(archive.read(names[0]).decode('utf-8-sig'))
-    if not isinstance(conversations, list):
-        raise ValueError('Expected conversations.json list')
+        members = archive.infolist()
+        if len(members) > max_zip_members:
+            raise ValueError('ZIP exceeds configured member limit')
+        legacy, parts = [], []
+        for entry in members:
+            directory, _, name = entry.filename.replace('\\', '/').rpartition('/')
+            if name == 'conversations.json':
+                legacy.append(entry)
+            match = re.fullmatch(r'conversations-([0-9]+)\.json', name)
+            if match:
+                parts.append((int(match[1]), directory, entry))
+        if legacy and parts:
+            raise ValueError('ZIP mixes conversations.json and numbered conversation parts')
+        if legacy:
+            if len(legacy) != 1:
+                raise ValueError('ZIP must contain exactly one conversations.json')
+            selected = legacy
+        elif parts:
+            indices = [index for index, _, _ in parts]
+            if len(set(indices)) != len(indices):
+                raise ValueError('ZIP has duplicate numbered conversation parts')
+            if len({directory for _, directory, _ in parts}) != 1:
+                raise ValueError('Numbered conversation parts must share one directory')
+            if sorted(indices) != list(range(len(parts))):
+                raise ValueError('Numbered conversation parts must start at zero without gaps')
+            selected = [entry for _, _, entry in sorted(parts, key=lambda part: part[0])]
+        else:
+            raise ValueError('ZIP must contain conversations.json or numbered conversation parts')
+        if any(entry.is_dir() or entry.flag_bits & 1 for entry in selected):
+            raise ValueError('Expected unencrypted conversation JSON files')
+        if sum(entry.file_size for entry in selected) > max_expanded_bytes:
+            raise ValueError('Expanded conversation JSON exceeds configured size limit')
+        conversations, remaining = [], max_expanded_bytes
+        for entry in selected:
+            with archive.open(entry) as stream:
+                expanded = read_bounded(stream, remaining, 'Expanded conversation JSON')
+            remaining -= len(expanded)
+            batch = json.loads(expanded.decode('utf-8-sig'))
+            if not isinstance(batch, list):
+                raise ValueError('Expected a conversation JSON list in every part')
+            conversations.extend(batch)
     packets = []
     for c in conversations:
         mapping = c.get('mapping')
@@ -151,16 +210,39 @@ def export_packets(raw, account_id=None):
                 return None
             content = msg.get('content') or {}
             parts = content.get('parts', [])
-            if content.get('content_type') != 'text' or not isinstance(parts, list) or not all(isinstance(x, str) for x in parts):
+            if content.get('content_type') == 'multimodal_text' and isinstance(parts, list):
+                supplied_text = []
+                for part in parts:
+                    if isinstance(part, str):
+                        if part.strip():
+                            supplied_text.append(part)
+                    elif (isinstance(part, dict) and part.get('content_type') == 'audio_transcription'
+                          and not set(part) - {'content_type', 'text', 'decoding_id', 'direction'}
+                          and isinstance(part.get('text'), str)):
+                        if part['text'].strip():
+                            supplied_text.append(part['text'])
+                    elif isinstance(part, dict) and part.get('content_type') == 'image_asset_pointer':
+                        pass  # Preserve the asset in the original ZIP; never follow its pointer.
+                    else:
+                        warnings.append({'conversation_id': conv, 'node_id': key, 'reason': 'Unsupported multimodal component retained in original ZIP only; text not inferred'})
+                        return None
+                if len(supplied_text) != 1:
+                    warnings.append({'conversation_id': conv, 'node_id': key, 'reason': 'Multimodal message without exactly one supplied text retained in ZIP; text not inferred or joined'})
+                    return None
+                text = supplied_text[0]
+                warnings.append({'conversation_id': conv, 'node_id': key, 'reason': 'Non-text multimodal data retained in original ZIP; exact supplied text indexed'})
+            elif content.get('content_type') != 'text' or not isinstance(parts, list) or not all(isinstance(x, str) for x in parts):
                 warnings.append({'conversation_id': conv, 'node_id': key, 'reason': 'Non-text/unsupported content retained in original ZIP only'})
                 return None
-            # A multipart text message has no specified separator. Do not fabricate one.
-            if len(parts) != 1:
-                warnings.append({'conversation_id': conv, 'node_id': key, 'reason': 'Multipart text retained in ZIP; separator not assumed'})
-                return None
-            if not parts[0].strip():
-                return None
-            return dict(text=parts[0], speaker=(msg.get('author') or {}).get('role'), message_id=msg.get('id'), source_date=source_time(msg.get('create_time')))
+            else:
+                # A multipart text message has no specified separator. Do not fabricate one.
+                if len(parts) != 1:
+                    warnings.append({'conversation_id': conv, 'node_id': key, 'reason': 'Multipart text retained in ZIP; separator not assumed'})
+                    return None
+                if not parts[0].strip():
+                    return None
+                text = parts[0]
+            return dict(text=text, speaker=(msg.get('author') or {}).get('role'), message_id=msg.get('id'), source_date=source_time(msg.get('create_time')))
         messages = []
         for key in branch:
             msg = read_message(key)
@@ -179,10 +261,15 @@ def export_packets(raw, account_id=None):
                     packets.append(validate_packet(dict(base, messages=[msg])))
     return packets, warnings
 
-def parse(path, raw, options):
+def parse(path, raw, options, *, max_file_bytes=MAX_FILE_BYTES,
+          max_expanded_bytes=MAX_EXPANDED_BYTES, max_zip_members=MAX_ZIP_MEMBERS):
+    validate_limits(max_file_bytes, max_expanded_bytes, max_zip_members)
+    if len(raw) > max_file_bytes:
+        raise ValueError('Input file exceeds configured size limit')
     suffix = path.suffix.lower()
     if suffix == '.zip':
-        return export_packets(raw, options.get('account_id'))
+        return export_packets(raw, options.get('account_id'), max_expanded_bytes=max_expanded_bytes,
+                              max_zip_members=max_zip_members)
     if suffix == '.json':
         return [validate_packet(json.loads(raw.decode('utf-8-sig')))], []
     if suffix not in {'.txt', '.md', '.markdown'}:
@@ -195,12 +282,24 @@ def parse(path, raw, options):
 def compatible(old, new):
     return old['text'] == new['text'] and (not old.get('speaker') or not new.get('speaker') or old['speaker'] == new['speaker']) and (not old.get('message_id') or not new.get('message_id') or old['message_id'] == new['message_id'])
 
-def candidates(db, p):
+def candidates(db, p, identities=None):
     """Only reconcile excerpts inside an explicitly identified conversation/account scope."""
     matches, uncertain = {}, []
     if p['kind'] != 'excerpt' or not p.get('conversation_id'):
         return matches, uncertain
-    old_packets = db.execute('SELECT packet_key,metadata_json FROM import_packets').fetchall()
+    identities = identities or {}
+    unresolved = set(range(len(p['messages']))) - set(identities)
+    # Authoritative identities need no text comparison with other known identities.
+    # Anonymous entities still need the existing conservative overlap checks so a
+    # later authoritative packet can attach provenance to an earlier manual drop.
+    anonymous_only = not unresolved
+    old_packets = db.execute('''SELECT DISTINCT p.packet_key,p.metadata_json
+        FROM import_entities e JOIN import_revisions r ON r.entity_id=e.id
+        JOIN import_items i ON i.memory_id=r.memory_id
+        JOIN import_packets p ON p.packet_key=i.packet_key
+        WHERE e.kind='excerpt' AND ifnull(e.account_id,'')=? AND e.conversation_id=?
+        AND e.canonical_id IS NULL AND (?=0 OR e.message_id IS NULL)''',
+        (p.get('account_id') or '',p['conversation_id'],int(anonymous_only))).fetchall()
     for packet in old_packets:
         old = json.loads(packet['metadata_json'])
         if old['kind'] != 'excerpt' or old.get('account_id') != p.get('account_id') or old.get('conversation_id') != p['conversation_id']:
@@ -211,12 +310,17 @@ def candidates(db, p):
                 e = db.execute('SELECT * FROM import_entities WHERE id=?', (e['canonical_id'],)).fetchone()
             return e['id']
         oldms, newms = old['messages'], p['messages']
+        roots = [root(item) for item in items]
+        anonymous = {i for i,eid in enumerate(roots) if db.execute(
+            'SELECT message_id FROM import_entities WHERE id=?',(eid,)).fetchone()[0] is None}
+        def relevant(i,j):
+            return j in unresolved or i in anonymous
         verified = set()
         # Explicit source order is stronger than matching local list indexes.
         for j, n in enumerate(newms):
             for i, o in enumerate(oldms):
-                if compatible(o, n) and o.get('source_order') is not None and o.get('source_order') == n.get('source_order'):
-                    matches.setdefault(j, set()).add(root(items[i]))
+                if relevant(i,j) and compatible(o, n) and o.get('source_order') is not None and o.get('source_order') == n.get('source_order'):
+                    matches.setdefault(j, set()).add(roots[i])
                     verified.add((i,j))
         # Match the entire shorter contiguous excerpt only when it occurs once,
         # has >=2 messages, and there is no contradictory source order.
@@ -225,12 +329,13 @@ def candidates(db, p):
         if len(short) >= 2 and len(offsets) == 1:
             for k in range(len(short)):
                 i,j = (k,offsets[0]+k) if old_short else (offsets[0]+k,k)
-                matches.setdefault(j,set()).add(root(items[i]))
+                if relevant(i,j):
+                    matches.setdefault(j,set()).add(roots[i])
                 verified.add((i,j))
         for j,n in enumerate(newms):
             for i,o in enumerate(oldms):
-                if compatible(o,n) and (i,j) not in verified:
-                    uncertain.append((j,root(items[i]),'Exact text without verified unique order; retained separately'))
+                if relevant(i,j) and compatible(o,n) and (i,j) not in verified:
+                    uncertain.append((j,roots[i],'Exact text without verified unique order; retained separately'))
     # One old message cannot stand for two incoming messages.
     counts = {}
     for ids in matches.values():
@@ -256,14 +361,21 @@ def merge_entity(db, old_id, target_id):
         else:
             db.execute('UPDATE import_revisions SET entity_id=? WHERE memory_id=?', (target_id,r['memory_id']))
 
-def import_file(path, db_path=ROOT/'memory.sqlite3', **options):
+def import_file(path, db_path=ROOT/'memory.sqlite3', *, max_file_bytes=MAX_FILE_BYTES,
+                max_expanded_bytes=MAX_EXPANDED_BYTES, max_zip_members=MAX_ZIP_MEMBERS,
+                expected_sha256=None, **options):
     if is_temporary_file(path):
         raise ValueError('Temporary input is not finalized; rename it before importing')
     path = Path(path).resolve()
     if is_temporary_file(path):
         raise ValueError('Temporary input is not finalized; rename it before importing')
-    raw = path.read_bytes()
-    packets, warnings = parse(path, raw, options)
+    validate_limits(max_file_bytes, max_expanded_bytes, max_zip_members)
+    with path.open('rb') as stream:
+        raw = read_bounded(stream, max_file_bytes, 'Input file')
+    if expected_sha256 is not None and digest(raw) != expected_sha256:
+        raise ValueError('Input changed before import; original expected bytes were not imported')
+    packets, warnings = parse(path, raw, options, max_file_bytes=max_file_bytes,
+                              max_expanded_bytes=max_expanded_bytes, max_zip_members=max_zip_members)
     backup = migrate(db_path)
     result = dict(file=str(path), sha256=digest(raw), backup=backup, added_revisions=0, reused_messages=0, linked_entities=0, repeated_packets=0, uncertain=[], warnings=warnings)
     with closing(sqlite3.connect(db_path, timeout=30)) as db:
@@ -283,13 +395,18 @@ def import_file(path, db_path=ROOT/'memory.sqlite3', **options):
                     result['repeated_packets'] += 1
                     result['uncertain'].extend(dict(row) for row in db.execute('SELECT * FROM import_uncertain WHERE packet_key=?',(key,)))
                     continue
-                matches, uncertain = candidates(db,p)
+                identities = {}
+                if p.get('conversation_id'):
+                    for pos,m in enumerate(p['messages']):
+                        if m.get('message_id'):
+                            identity = db.execute('SELECT * FROM import_entities WHERE kind=? AND ifnull(account_id,\'\')=? AND conversation_id=? AND message_id=? AND canonical_id IS NULL', (p['kind'],p.get('account_id') or '',p['conversation_id'],m['message_id'])).fetchone()
+                            if identity:
+                                identities[pos] = identity
+                matches, uncertain = candidates(db,p,identities)
                 db.execute('INSERT INTO import_packets VALUES(?,?,?)', (key,encoded(p).decode(),stamp))
                 db.execute('INSERT INTO import_packet_sources VALUES(?,?)', (key,sha))
                 for pos,m in enumerate(p['messages']):
-                    identity = None
-                    if p.get('conversation_id') and m.get('message_id'):
-                        identity = db.execute('SELECT * FROM import_entities WHERE kind=? AND ifnull(account_id,\'\')=? AND conversation_id=? AND message_id=? AND canonical_id IS NULL', (p['kind'],p.get('account_id') or '',p['conversation_id'],m['message_id'])).fetchone()
+                    identity = identities.get(pos)
                     ids = matches.get(pos,set())
                     # Never coalesce conflicting known message IDs on text evidence.
                     eligible = []
@@ -347,11 +464,24 @@ def main():
     parser.add_argument('paths', nargs='*', help='Files or directories; default: project inbox (nonrecursive)')
     parser.add_argument('--db', type=Path, default=ROOT/'memory.sqlite3')
     parser.add_argument('--init', action='store_true', help='Back up/migrate only')
+    parser.add_argument('--max-file-mib', type=int, default=MAX_FILE_BYTES // (1024 * 1024),
+                        help='Explicit input-file allowance in MiB (default 32, maximum 1024)')
+    parser.add_argument('--max-expanded-mib', type=int, default=MAX_EXPANDED_BYTES // (1024 * 1024),
+                        help='Explicit expanded conversations.json allowance in MiB (default 128, maximum 1024)')
+    parser.add_argument('--max-zip-members', type=int, default=MAX_ZIP_MEMBERS,
+                        help='Maximum ZIP entries inspected (default 10000, maximum 100000)')
     for key in ('kind','title','account-id','conversation-id','message-id','source-url','source-date','speaker'):
         parser.add_argument('--'+key, choices=sorted(KINDS) if key=='kind' else None)
     parser.add_argument('--source-order', type=int)
     args = vars(parser.parse_args())
     paths, db_path, init = args.pop('paths'),args.pop('db'),args.pop('init')
+    limits = dict(max_file_bytes=args.pop('max_file_mib') * 1024 * 1024,
+                  max_expanded_bytes=args.pop('max_expanded_mib') * 1024 * 1024,
+                  max_zip_members=args.pop('max_zip_members'))
+    try:
+        validate_limits(**limits)
+    except ValueError as error:
+        parser.error(str(error))
     options = {k:v for k,v in args.items() if v is not None}
     if init:
         print(json.dumps({'backup':migrate(db_path)},indent=2))
@@ -363,7 +493,7 @@ def main():
     failed = False
     for path in inputs:
         try:
-            print(json.dumps(import_file(path,db_path,**options),indent=2,ensure_ascii=False))
+            print(json.dumps(import_file(path,db_path,**limits,**options),indent=2,ensure_ascii=False))
         except Exception as exc:
             failed=True
             print(json.dumps({'file':str(path),'error':str(exc)},ensure_ascii=False))

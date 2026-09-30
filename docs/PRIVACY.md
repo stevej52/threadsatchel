@@ -16,7 +16,7 @@ The database, raw imported objects, queues, and backups are plaintext. Protect t
 
 server_readonly.py uses SQLite read-only mode, sets query_only, exposes no store tool, and does not create a missing database. Tool annotations alone are not the access boundary. server.py is intentionally separate and can append new records.
 
-A read-only client can still read sensitive memories. Grant access deliberately. Do not expose a raw stdio process or database as an unauthenticated internet service. Hosted access/authentication is outside this release.
+A read-only client can still read sensitive memories. Grant access deliberately. Do not expose a raw stdio process or database as an unauthenticated internet service. Hosted access/authentication belongs to your separately built integration; see [Create your own plugin](CREATE_YOUR_OWN_PLUGIN.md). Its gateway temporarily handles requests/results and optional save packets, even though the authoritative archive stays local. Protect and expire that data, restrict operations to the owner, and keep credentials out of source and logs.
 
 ## Source text is untrusted
 
