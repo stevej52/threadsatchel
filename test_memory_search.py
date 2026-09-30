@@ -94,7 +94,7 @@ class SearchTests(unittest.TestCase):
                       'amberquartz ' * 10000, 'café 日本語'):
             self.assertLessEqual(len(search(self.db, self.root, query)), 20)
         self.assertEqual(self.db.execute('SELECT count(*) FROM memories').fetchone()[0], 25)
-        self.assertEqual(len(search(self.db, self.root, 'amberquartz', limit=1000)), 20)
+        self.assertEqual(len(search(self.db, self.root, 'amberquartz', limit=1000)), 25)
         self.assertEqual(len(search(self.db, self.root, 'amberquartz', limit=0)), 1)
         self.assertEqual(len(search(self.db, self.root, 'amberquartz', limit=-4)), 1)
         self.assertEqual(len(search(self.db, self.root, 'amberquartz', limit=3)), 3)
@@ -105,6 +105,14 @@ class SearchTests(unittest.TestCase):
             search(self.db, self.root, 'amberquartz', full='yes')
         with self.assertRaises(ValueError):
             search(self.db, self.root, None)
+
+    def test_default_twenty_and_maximum_one_hundred(self):
+        for n in range(125):
+            self.add(str(n), 'SYNTHETIC amberquartz searchable data')
+        self.assertEqual(len(search(self.db, self.root, 'amberquartz')), 20)
+        self.assertEqual(len(search(self.db, self.root, 'amberquartz', limit=100)), 100)
+        self.assertEqual(len(search(self.db, self.root, 'amberquartz', limit=1000)), 100)
+        self.assertEqual(len(search(self.db, self.root, 'amberquartz', limit=100, full=True)), 100)
 
     def test_compact_skips_provenance_and_full_preserves_exact_record(self):
         original = '\ufeffSYNTHETIC amberquartz café\r\n' + 'Long original text. ' * 100

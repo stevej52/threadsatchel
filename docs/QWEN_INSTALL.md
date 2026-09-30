@@ -170,14 +170,15 @@ Wait for this to succeed and show a `data` entry whose model ID starts with `thr
 
 Read the JSON results, including coverage, errors, held work, and deferred states. A successful process exit alone is not proof that every chunk was analyzed. `process` normally allows an initial CPU embedding pass followed by a bounded analysis pass (defaults: six analysis chunks / 90 seconds, plus the initial embedding allowance). Large archives need many passes. The synthetic example should produce source-linked derived output; inspect its quoted originals. A short exact-match search may correctly bypass Qwen entirely.
 
-Connect or reconnect your local MCP client using [CONNECTING.md](CONNECTING.md). Confirm all four tools:
+Connect or reconnect your local MCP client using [CONNECTING.md](CONNECTING.md). Confirm all five tools:
 
 - `search_memory`: ask for **sample archive**; results should point to the imported originals.
+- `list_memories`: inspect a page of original-record previews and follow `next_cursor` to continue; counts refer to records, not AI chunks.
 - `get_memory`: retrieve one returned ID and verify the synthetic text and provenance.
 - `get_project_brief`: request `general` and inspect coverage and source links.
 - `memory_ai_status`: inspect enablement, processing status, and any worker/cache reports.
 
-No ChatGPT phone/web integration is installed by these steps. Your particular client still needs a supported, explicitly authorized connection to the tools; a URL or these files alone does not provide one.
+No ChatGPT phone/web integration is installed by these steps. For your own plugin and the private gateway approach tested with Dot, follow [Create your own plugin](CREATE_YOUR_OWN_PLUGIN.md). Your particular client still needs a supported, explicitly authorized connection to the tools; a URL or these files alone does not provide one.
 
 ## 5. Optional scheduling and spare CPU/RAM
 

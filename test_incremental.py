@@ -30,7 +30,7 @@ async def run():
     with tempfile.TemporaryDirectory(prefix='threadsatchel-synthetic-') as temp:
         root=Path(temp)
         dbpath=root/'memory.sqlite3'
-        for name in ('server.py','server_readonly.py','import_metadata.py','memory_search.py','ai_memory.py'):
+        for name in ('server.py','server_readonly.py','import_metadata.py','memory_search.py','memory_listing.py','ai_memory.py'):
             shutil.copy2(ROOT/name,root/name)
         with closing(sqlite3.connect(dbpath)) as db, db:
             db.execute('CREATE TABLE memories(id TEXT PRIMARY KEY,text TEXT NOT NULL,source TEXT NOT NULL,title TEXT,created_at TEXT NOT NULL)')
@@ -52,11 +52,16 @@ async def run():
         assert first['added_revisions']==2
         params=StdioServerParameters(command=sys.executable,args=[str(root/'server_readonly.py')])
         async with Client(params) as client:
-            assert sorted(t.name for t in (await client.list_tools()).tools)==['get_memory','get_project_brief','memory_ai_status','search_memory']
+            assert sorted(t.name for t in (await client.list_tools()).tools)==['get_memory','get_project_brief','list_memories','memory_ai_status','search_memory']
             hits=await tool(client,'search_memory',query='amberquartz',full=True)
             assert len(hits)==2
             saved=hits[0]['id']
             assert (await tool(client,'get_memory',id=saved))['import_metadata']['kind']=='excerpt'
+            page=await tool(client,'list_memories',limit=1)
+            assert page['returned_count']==1 and page['total_count']==3 and page['next_cursor']
+            last=await tool(client,'list_memories',cursor=page['next_cursor'])
+            assert last['next_cursor'] is None and last['returned_total']==3
+            assert len({r['id'] for r in page['records']+last['records']})==3
         renamed=root/'renamed.json'
         shutil.copy2(a,renamed)
         assert import_file(renamed,dbpath)['added_revisions']==0
@@ -143,7 +148,7 @@ async def run():
         passed.append('Forced mid-import failure rolls back bytes, records and FTS; integrity and foreign keys pass')
         writable=StdioServerParameters(command=sys.executable,args=[str(root/'server.py')])
         async with Client(writable) as client:
-            assert sorted(t.name for t in (await client.list_tools()).tools)==['get_memory','get_project_brief','memory_ai_status','search_memory','store_memory']
+            assert sorted(t.name for t in (await client.list_tools()).tools)==['get_memory','get_project_brief','list_memories','memory_ai_status','search_memory','store_memory']
             stored=await tool(client,'store_memory',text='SYNTHETIC writabletool',source='SYNTHETIC TEST')
             assert (await tool(client,'get_memory',id=stored['id']))==stored
             keyed=await tool(client,'store_memory',text='SYNTHETIC keyedretry',source='SYNTHETIC TEST',idempotency_key='synthetic-client:write-1')
@@ -152,7 +157,7 @@ async def run():
             assert len(await tool(client,'search_memory',query='keyedretry'))==1
             assert len(await tool(client,'search_memory',query='amberquartz'))==4
         passed.append('Existing writable MCP tools and store contract preserved; explicit keyed retries return one searchable record')
-    report=dict(status='PASS',tests=passed,fixtures='Clearly labeled synthetic data; isolated temporary database removed',actual_export_validation='PENDING: real ChatGPT ZIP not available')
+    report=dict(status='PASS',tests=passed,fixtures='Clearly labeled synthetic data; isolated temporary database removed',actual_export_validation='This suite uses synthetic fixtures; see docs/IMPORTING.md for the separately verified real export.')
     (ROOT/'incremental-test-results.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
     print(json.dumps(report,indent=2))
 

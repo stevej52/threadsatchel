@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import re
 import sqlite3
 from uuid import uuid4
 import zipfile
@@ -141,26 +142,51 @@ def source_time(value):
 
 def export_packets(raw, account_id=None, *, max_expanded_bytes=MAX_EXPANDED_BYTES,
                    max_zip_members=MAX_ZIP_MEMBERS):
-    """Known conversations.json graph shape; real-user ZIP validation is pending."""
+    """Parse the conversation graph from one legacy file or numbered JSON parts."""
     validate_limits(MAX_FILE_BYTES, max_expanded_bytes, max_zip_members)
     warnings = []
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         members = archive.infolist()
         if len(members) > max_zip_members:
             raise ValueError('ZIP exceeds configured member limit')
-        selected = [entry for entry in members if entry.filename.replace('\\', '/').split('/')[-1] == 'conversations.json']
-        if len(selected) != 1:
-            raise ValueError('ZIP must contain exactly one conversations.json')
-        entry = selected[0]
-        if entry.is_dir() or entry.flag_bits & 1:
-            raise ValueError('Expected an unencrypted conversations.json file')
-        if entry.file_size > max_expanded_bytes:
-            raise ValueError('Expanded conversations.json exceeds configured size limit')
-        with archive.open(entry) as stream:
-            expanded = read_bounded(stream, max_expanded_bytes, 'Expanded conversations.json')
-        conversations = json.loads(expanded.decode('utf-8-sig'))
-    if not isinstance(conversations, list):
-        raise ValueError('Expected conversations.json list')
+        legacy, parts = [], []
+        for entry in members:
+            directory, _, name = entry.filename.replace('\\', '/').rpartition('/')
+            if name == 'conversations.json':
+                legacy.append(entry)
+            match = re.fullmatch(r'conversations-([0-9]+)\.json', name)
+            if match:
+                parts.append((int(match[1]), directory, entry))
+        if legacy and parts:
+            raise ValueError('ZIP mixes conversations.json and numbered conversation parts')
+        if legacy:
+            if len(legacy) != 1:
+                raise ValueError('ZIP must contain exactly one conversations.json')
+            selected = legacy
+        elif parts:
+            indices = [index for index, _, _ in parts]
+            if len(set(indices)) != len(indices):
+                raise ValueError('ZIP has duplicate numbered conversation parts')
+            if len({directory for _, directory, _ in parts}) != 1:
+                raise ValueError('Numbered conversation parts must share one directory')
+            if sorted(indices) != list(range(len(parts))):
+                raise ValueError('Numbered conversation parts must start at zero without gaps')
+            selected = [entry for _, _, entry in sorted(parts, key=lambda part: part[0])]
+        else:
+            raise ValueError('ZIP must contain conversations.json or numbered conversation parts')
+        if any(entry.is_dir() or entry.flag_bits & 1 for entry in selected):
+            raise ValueError('Expected unencrypted conversation JSON files')
+        if sum(entry.file_size for entry in selected) > max_expanded_bytes:
+            raise ValueError('Expanded conversation JSON exceeds configured size limit')
+        conversations, remaining = [], max_expanded_bytes
+        for entry in selected:
+            with archive.open(entry) as stream:
+                expanded = read_bounded(stream, remaining, 'Expanded conversation JSON')
+            remaining -= len(expanded)
+            batch = json.loads(expanded.decode('utf-8-sig'))
+            if not isinstance(batch, list):
+                raise ValueError('Expected a conversation JSON list in every part')
+            conversations.extend(batch)
     packets = []
     for c in conversations:
         mapping = c.get('mapping')
@@ -184,16 +210,39 @@ def export_packets(raw, account_id=None, *, max_expanded_bytes=MAX_EXPANDED_BYTE
                 return None
             content = msg.get('content') or {}
             parts = content.get('parts', [])
-            if content.get('content_type') != 'text' or not isinstance(parts, list) or not all(isinstance(x, str) for x in parts):
+            if content.get('content_type') == 'multimodal_text' and isinstance(parts, list):
+                supplied_text = []
+                for part in parts:
+                    if isinstance(part, str):
+                        if part.strip():
+                            supplied_text.append(part)
+                    elif (isinstance(part, dict) and part.get('content_type') == 'audio_transcription'
+                          and not set(part) - {'content_type', 'text', 'decoding_id', 'direction'}
+                          and isinstance(part.get('text'), str)):
+                        if part['text'].strip():
+                            supplied_text.append(part['text'])
+                    elif isinstance(part, dict) and part.get('content_type') == 'image_asset_pointer':
+                        pass  # Preserve the asset in the original ZIP; never follow its pointer.
+                    else:
+                        warnings.append({'conversation_id': conv, 'node_id': key, 'reason': 'Unsupported multimodal component retained in original ZIP only; text not inferred'})
+                        return None
+                if len(supplied_text) != 1:
+                    warnings.append({'conversation_id': conv, 'node_id': key, 'reason': 'Multimodal message without exactly one supplied text retained in ZIP; text not inferred or joined'})
+                    return None
+                text = supplied_text[0]
+                warnings.append({'conversation_id': conv, 'node_id': key, 'reason': 'Non-text multimodal data retained in original ZIP; exact supplied text indexed'})
+            elif content.get('content_type') != 'text' or not isinstance(parts, list) or not all(isinstance(x, str) for x in parts):
                 warnings.append({'conversation_id': conv, 'node_id': key, 'reason': 'Non-text/unsupported content retained in original ZIP only'})
                 return None
-            # A multipart text message has no specified separator. Do not fabricate one.
-            if len(parts) != 1:
-                warnings.append({'conversation_id': conv, 'node_id': key, 'reason': 'Multipart text retained in ZIP; separator not assumed'})
-                return None
-            if not parts[0].strip():
-                return None
-            return dict(text=parts[0], speaker=(msg.get('author') or {}).get('role'), message_id=msg.get('id'), source_date=source_time(msg.get('create_time')))
+            else:
+                # A multipart text message has no specified separator. Do not fabricate one.
+                if len(parts) != 1:
+                    warnings.append({'conversation_id': conv, 'node_id': key, 'reason': 'Multipart text retained in ZIP; separator not assumed'})
+                    return None
+                if not parts[0].strip():
+                    return None
+                text = parts[0]
+            return dict(text=text, speaker=(msg.get('author') or {}).get('role'), message_id=msg.get('id'), source_date=source_time(msg.get('create_time')))
         messages = []
         for key in branch:
             msg = read_message(key)

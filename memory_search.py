@@ -4,7 +4,7 @@ import re
 
 from import_metadata import compact_source_ids, enrich_many
 
-MAX_RESULTS = 20
+MAX_RESULTS = 100
 MAX_TEXT = 600
 MAX_QUERY = 2048
 MAX_TERMS = 32
@@ -54,7 +54,7 @@ def _query_plan(query):
 
 
 def validate_limit(limit):
-    """Clamp integer limits to the documented 1..20 window; reject implicit coercion."""
+    """Clamp integer limits to the documented 1..100 window; reject implicit coercion."""
     if isinstance(limit, bool) or not isinstance(limit, int):
         raise ValueError('limit must be an integer')
     return max(1, min(MAX_RESULTS, limit))
