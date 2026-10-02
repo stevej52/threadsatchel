@@ -1,6 +1,7 @@
 """Read-only imported metadata, loaded once per result batch."""
 from collections import defaultdict
 import json
+from import_memory import extra_field_warnings
 
 
 def _marks(values):
@@ -81,10 +82,18 @@ def enrich_many(db, rows):
     for item in provenance_rows:
         packet = json.loads(item['packet'])
         packet.pop('messages', None)
-        provenance[item['canonical_memory_id']].append(dict(
+        message = json.loads(item['metadata_json'])
+        entry = dict(
             sha256=item['object_sha'], imported_at=item['imported_at'],
             packet_position=item['position'], packet=packet,
-            message=json.loads(item['metadata_json']), paths=list(paths[item['object_sha']])))
+            message=message, paths=list(paths[item['object_sha']]))
+        notes = extra_field_warnings(packet, message=message, position=item['position'])
+        if notes:
+            # Generated notes cannot collide with caller-supplied notes/provenance:
+            # those values remain unchanged inside packet/message above.
+            entry['import_notes'] = notes
+            entry['import_status'] = 'imported_with_warnings'
+        provenance[item['canonical_memory_id']].append(entry)
     entity_ids = list(dict.fromkeys(entity['id'] for entity in entities.values()))
     revision_ids = defaultdict(list)
     for row in db.execute('SELECT entity_id,memory_id FROM import_revisions WHERE entity_id IN ('

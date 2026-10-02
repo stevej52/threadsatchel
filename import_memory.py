@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import hashlib
 import io
 import json
+import math
 from pathlib import Path
 import re
 import sqlite3
@@ -17,6 +18,126 @@ MAX_FILE_BYTES = 32 * 1024 * 1024
 MAX_EXPANDED_BYTES = 128 * 1024 * 1024
 MAX_ZIP_MEMBERS = 10000
 ABSOLUTE_MAX_BYTES = 1024 * 1024 * 1024
+PACKET_FIELDS = frozenset({'format', 'kind', 'title', 'account_id', 'conversation_id',
+                          'source_url', 'source_date', 'derived_from', 'messages'})
+MESSAGE_FIELDS = frozenset({'text', 'speaker', 'message_id', 'source_order', 'source_date', 'source_url'})
+IMPORT_ERROR_MESSAGES = {
+    'invalid_packet': 'Packet must be an object.',
+    'unsupported_format': 'Expected format threadsatchel/1 or steve-memory/1.',
+    'invalid_kind': 'kind must be excerpt, summary, or note.',
+    'invalid_metadata': 'A supported metadata field has an invalid value.',
+    'invalid_messages': 'messages must be a nonempty list.',
+    'invalid_message': 'Every message must be an object.',
+    'invalid_text': 'Every message needs nonempty text.',
+    'invalid_source_order': 'source_order must be a known nonnegative integer, or omitted.',
+    'duplicate_identity': 'Duplicate message_id or source_order in packet; split revisions into separate packets.',
+    'invalid_json_value': 'Packet metadata must contain finite JSON values with at most 100 nesting levels.',
+    'invalid_json': 'Input is not valid JSON.',
+    'invalid_utf8': 'Input must use valid UTF-8 text.',
+    'input_not_finalized': 'Temporary input is not finalized; rename it before importing.',
+    'input_changed': 'Input changed before import; original expected bytes were not imported.',
+    'unsupported_file_type': 'Supported files: .txt, .md, .markdown, .json, .zip.',
+    'size_limit': 'Input exceeds the configured import limits.',
+    'invalid_export': 'The export layout or contents are unsupported or invalid.',
+    'database_error': 'Database operation failed; import success was not confirmed.',
+    'file_access_error': 'Input or database file could not be accessed.',
+    'import_failed': 'Import failed; original input was not deleted.',
+}
+
+
+class ImportValidationError(ValueError):
+    """Only fixed diagnostic messages and generated structural locations are public."""
+    def __init__(self, code, location='$'):
+        self.code = code
+        self.location = location
+        super().__init__(IMPORT_ERROR_MESSAGES[code])
+
+
+def describe_import_error(exc):
+    """Describe failures without exposing packet text, extra field names, or paths."""
+    detail = {}
+    if isinstance(exc, ImportValidationError):
+        code = exc.code
+        detail['location'] = exc.location
+    elif isinstance(exc, json.JSONDecodeError):
+        code = 'invalid_json'
+        detail.update(line=exc.lineno, column=exc.colno)
+    elif isinstance(exc, UnicodeError):
+        code = 'invalid_utf8'
+    elif isinstance(exc, sqlite3.Error):
+        code = 'database_error'
+    elif isinstance(exc, OSError):
+        code = 'file_access_error'
+    elif isinstance(exc, (zipfile.BadZipFile, zipfile.LargeZipFile)):
+        code = 'invalid_export'
+    elif isinstance(exc, ValueError):
+        # Exact known diagnostic text only: never forward arbitrary exception text.
+        message = str(exc)
+        if message == 'Temporary input is not finalized; rename it before importing':
+            code = 'input_not_finalized'
+        elif message == 'Input changed before import; original expected bytes were not imported':
+            code = 'input_changed'
+        elif message == 'Supported files: .txt, .md, .markdown, .json, .zip':
+            code = 'unsupported_file_type'
+        elif message in {
+                'Import byte limits must be between 1 byte and 1 GiB',
+                'ZIP member limit must be between 1 and 100000',
+                'Input file exceeds configured size limit',
+                'Input file exceeds configured size limit; use an explicit larger allowance after review',
+                'Expanded conversation JSON exceeds configured size limit',
+                'Expanded conversation JSON exceeds configured size limit; use an explicit larger allowance after review',
+                'ZIP exceeds configured member limit'}:
+            code = 'size_limit'
+        elif message in {
+                'ZIP mixes conversations.json and numbered conversation parts',
+                'ZIP must contain exactly one conversations.json',
+                'ZIP has duplicate numbered conversation parts',
+                'Numbered conversation parts must share one directory',
+                'Numbered conversation parts must start at zero without gaps',
+                'ZIP must contain conversations.json or numbered conversation parts',
+                'Expected unencrypted conversation JSON files',
+                'Expected a conversation JSON list in every part',
+                'Unsupported export: missing mapping',
+                'Export graph has a cycle or missing parent', 'Unsupported export timestamp'}:
+            code = 'invalid_export'
+        else:
+            code = 'import_failed'
+    else:
+        code = 'import_failed'
+    return dict(code=code, message=IMPORT_ERROR_MESSAGES[code], **detail)
+
+
+def validate_json_values(value):
+    """Extras are inert JSON, not objects to execute or promote into core metadata."""
+    pending = [(value, 0)]
+    while pending:
+        current, depth = pending.pop()
+        if depth > 100:
+            raise ImportValidationError('invalid_json_value')
+        if current is None or type(current) in (str, bool, int):
+            continue
+        if type(current) is float and math.isfinite(current):
+            continue
+        if isinstance(current, dict) and all(isinstance(key, str) for key in current):
+            pending.extend((child, depth + 1) for child in current.values())
+        elif isinstance(current, list):
+            pending.extend((child, depth + 1) for child in current)
+        else:
+            raise ImportValidationError('invalid_json_value')
+
+
+def extra_field_warnings(packet, *, message=None, position=None):
+    """Safe notices only; extra names/values stay in preserved packet/item metadata."""
+    warnings = []
+    scopes = [('$', packet, PACKET_FIELDS)]
+    messages = enumerate(packet.get('messages', [])) if message is None else [(position, message)]
+    scopes.extend((f'$.messages[{index}]', item, MESSAGE_FIELDS) for index, item in messages)
+    for location, value, fields in scopes:
+        count = len(set(value) - fields)
+        if count:
+            warnings.append(dict(code='extra_fields_preserved', location=location, field_count=count,
+                message='Additional fields were preserved as inert metadata; not used as identity, dates, or instructions.'))
+    return warnings
 
 
 def validate_limits(max_file_bytes, max_expanded_bytes, max_zip_members):
@@ -45,7 +166,7 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 def encoded(value):
-    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
 
 SCHEMA = '''
 CREATE TABLE import_schema(version INTEGER PRIMARY KEY CHECK(version=1));
@@ -94,40 +215,40 @@ def migrate(db_path):
 
 def validate_packet(p):
     if not isinstance(p, dict):
-        raise ValueError('Packet must be an object')
-    allowed = {'format', 'kind', 'title', 'account_id', 'conversation_id', 'source_url', 'source_date', 'derived_from', 'messages'}
-    if set(p) - allowed:
-        raise ValueError('Unknown packet fields: ' + ', '.join(sorted(set(p)-allowed)))
+        raise ImportValidationError('invalid_packet')
+    validate_json_values(p)
+    allowed = PACKET_FIELDS
     if p.get('format', 'threadsatchel/1') not in ('threadsatchel/1', 'steve-memory/1'):
-        raise ValueError('Expected format threadsatchel/1')
+        raise ImportValidationError('unsupported_format', '$.format')
     # Keep the legacy canonical marker stable so existing packet hashes still deduplicate.
     p = dict(p, format='steve-memory/1', kind=p.get('kind', 'excerpt'))
-    if p['kind'] not in KINDS:
-        raise ValueError('kind must be excerpt, summary, or note')
+    if not isinstance(p['kind'], str) or p['kind'] not in KINDS:
+        raise ImportValidationError('invalid_kind', '$.kind')
     for k in allowed - {'messages', 'derived_from'}:
         if k in p and p[k] is not None and (not isinstance(p[k], str) or not p[k].strip()):
-            raise ValueError(k + ' must be a nonempty string or null')
+            raise ImportValidationError('invalid_metadata', '$.' + k)
     if 'derived_from' in p and not isinstance(p['derived_from'], list):
-        raise ValueError('derived_from must be a list of source references')
+        raise ImportValidationError('invalid_metadata', '$.derived_from')
     messages = p.get('messages')
     if not isinstance(messages, list) or not messages:
-        raise ValueError('messages must be a nonempty list')
+        raise ImportValidationError('invalid_messages', '$.messages')
     seen_ids, seen_orders = set(), set()
-    for m in messages:
-        if not isinstance(m, dict) or set(m) - {'text', 'speaker', 'message_id', 'source_order', 'source_date', 'source_url'}:
-            raise ValueError('Invalid message fields')
+    for position, m in enumerate(messages):
+        location = f'$.messages[{position}]'
+        if not isinstance(m, dict):
+            raise ImportValidationError('invalid_message', location)
         if not isinstance(m.get('text'), str) or not m['text'].strip():
-            raise ValueError('Every message needs nonempty text')
+            raise ImportValidationError('invalid_text', location + '.text')
         for k in ('speaker', 'message_id', 'source_date', 'source_url'):
             if m.get(k) is not None and (not isinstance(m[k], str) or not m[k].strip()):
-                raise ValueError(k + ' must be a nonempty string or null')
+                raise ImportValidationError('invalid_metadata', location + '.' + k)
         order = m.get('source_order')
         if order is not None and (type(order) is not int or order < 0):
-            raise ValueError('source_order must be a known nonnegative integer, or omitted')
+            raise ImportValidationError('invalid_source_order', location + '.source_order')
         for value, seen, label in ((m.get('message_id'), seen_ids, 'message_id'), (order, seen_orders, 'source_order')):
             if value is not None:
                 if value in seen:
-                    raise ValueError('Duplicate ' + label + ' in packet; split revisions into separate packets')
+                    raise ImportValidationError('duplicate_identity', location + '.' + label)
                 seen.add(value)
     return p
 
@@ -271,13 +392,15 @@ def parse(path, raw, options, *, max_file_bytes=MAX_FILE_BYTES,
         return export_packets(raw, options.get('account_id'), max_expanded_bytes=max_expanded_bytes,
                               max_zip_members=max_zip_members)
     if suffix == '.json':
-        return [validate_packet(json.loads(raw.decode('utf-8-sig')))], []
+        packet = validate_packet(json.loads(raw.decode('utf-8-sig')))
+        return [packet], extra_field_warnings(packet)
     if suffix not in {'.txt', '.md', '.markdown'}:
         raise ValueError('Supported files: .txt, .md, .markdown, .json, .zip')
     p = {k: v for k, v in options.items() if v is not None and k not in {'speaker', 'message_id', 'source_order'}}
     p['kind'] = p.get('kind', 'note')
     p['messages'] = [dict(text=raw.decode('utf-8-sig'), **{k: options[k] for k in ('speaker', 'message_id', 'source_order') if options.get(k) is not None})]
-    return [validate_packet(p)], []
+    packet = validate_packet(p)
+    return [packet], extra_field_warnings(packet)
 
 def compatible(old, new):
     return old['text'] == new['text'] and (not old.get('speaker') or not new.get('speaker') or old['speaker'] == new['speaker']) and (not old.get('message_id') or not new.get('message_id') or old['message_id'] == new['message_id'])
@@ -457,6 +580,10 @@ def import_file(path, db_path=ROOT/'memory.sqlite3', *, max_file_bytes=MAX_FILE_
         except Exception:
             db.rollback()
             raise
+    result['has_warnings'] = bool(warnings)
+    result['import_status'] = ('imported_with_warnings' if warnings else
+                               'imported' if result['added_revisions'] or result['linked_entities'] else
+                               'already_present')
     return result
 
 def main():
@@ -496,7 +623,9 @@ def main():
             print(json.dumps(import_file(path,db_path,**limits,**options),indent=2,ensure_ascii=False))
         except Exception as exc:
             failed=True
-            print(json.dumps({'file':str(path),'error':str(exc)},ensure_ascii=False))
+            detail = describe_import_error(exc)
+            print(json.dumps({'file':str(path), 'error':detail['message'],
+                              'error_detail':detail},ensure_ascii=False))
     raise SystemExit(1 if failed else 0)
 
 if __name__ == '__main__':

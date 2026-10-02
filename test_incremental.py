@@ -30,7 +30,7 @@ async def run():
     with tempfile.TemporaryDirectory(prefix='threadsatchel-synthetic-') as temp:
         root=Path(temp)
         dbpath=root/'memory.sqlite3'
-        for name in ('server.py','server_readonly.py','import_metadata.py','memory_search.py','memory_listing.py','ai_memory.py'):
+        for name in ('server.py','server_readonly.py','import_metadata.py','import_memory.py','memory_search.py','memory_listing.py','ai_memory.py'):
             shutil.copy2(ROOT/name,root/name)
         with closing(sqlite3.connect(dbpath)) as db, db:
             db.execute('CREATE TABLE memories(id TEXT PRIMARY KEY,text TEXT NOT NULL,source TEXT NOT NULL,title TEXT,created_at TEXT NOT NULL)')

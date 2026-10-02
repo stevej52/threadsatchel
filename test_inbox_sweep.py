@@ -150,6 +150,23 @@ class InboxSweepTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), raw)
         self.assertNotIn(fake, (self.root / 'inbox-sweep' / 'events.log').read_text())
 
+    def test_extras_import_with_notice_and_invalid_core_keeps_detail(self):
+        packet = json.loads(self.raw)
+        packet['provenance'] = {'note': 'SYNTHETIC source information'}
+        path = self.inbox / 'extra.json'
+        path.write_text(json.dumps(packet), encoding='utf-8')
+        first = sweep(self.root, settle_seconds=0)
+        self.assertEqual(first['added_revisions'], 1)
+        self.assertEqual(first['files'][0]['import_status'], 'imported_with_warnings')
+        self.assertEqual(sweep(self.root, settle_seconds=0)['added_revisions'], 0)
+        packet['messages'][0]['text'] = ''
+        (self.inbox / 'invalid.json').write_text(json.dumps(packet), encoding='utf-8')
+        failed = sweep(self.root, settle_seconds=0)
+        item = next(x for x in failed['files'] if x['file'] == 'invalid.json')
+        self.assertEqual(item['error_detail']['code'], 'invalid_text')
+        repeated = sweep(self.root, settle_seconds=0)
+        self.assertEqual(next(x for x in repeated['files'] if x['file'] == 'invalid.json')['error_detail'], item['error_detail'])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -99,7 +99,7 @@ flowchart TD
   I --> M
 ```
 
-The read-only MCP endpoint exposes `search_memory`, `get_memory`, `get_project_brief`, and `memory_ai_status`. Full text and provenance remain available through `get_memory`; AI-derived results link back to those originals. The model never becomes the authoritative archive.
+The read-only MCP endpoint exposes `search_memory`, `list_memories`, `get_memory`, `get_project_brief`, and `memory_ai_status`. Full text and provenance remain available through `get_memory`; AI-derived results link back to those originals. The model never becomes the authoritative archive.
 
 For the optional layer, after installation and service startup:
 
@@ -112,6 +112,12 @@ python memory_ai.py off
 ```
 
 These are individual controls, not a startup script: the embedding owner must already be running before processing or semantic search. Follow the [startup order](docs/QWEN_INSTALL.md#4-enable-and-test-in-the-right-order). The off switch preserves the archive and derived cache; an in-flight operation may finish.
+
+## Save results and extra fields
+
+Valid packets can include extra fields such as `provenance` or `notes`. The importer preserves them as inert metadata, keeps original file bytes and message text unchanged, and reports `import_status: "imported_with_warnings"` with `has_warnings: true`. Full retrieval includes generated import notes beside the preserved fields. Invalid required text, format, and identity fields still fail validation.
+
+[Save results and troubleshooting](docs/SAVE_RESULTS.md) explains the result fields, safe error details, and retry procedure. Repeat the unchanged finalized packet; a custom gateway must also reuse the same request key. Extra metadata is not automatically merged by meaning. The repository's read-only stdio server provides retrieval; remote save operations and their durable error logs require your separately built personal connector.
 
 ## Read before importing your history
 

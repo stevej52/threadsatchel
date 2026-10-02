@@ -14,7 +14,7 @@ import stat
 import time
 
 from codex_capture import capture_lock, dump_atomic, SECRET
-from import_memory import import_file, is_temporary_file, parse
+from import_memory import import_file, is_temporary_file, parse, describe_import_error
 
 ROOT = Path(__file__).resolve().parent
 FORMATS = {'.json', '.txt', '.md', '.markdown'}
@@ -173,6 +173,8 @@ def _sweep(root, inbox, db_path, runtime, settle_seconds, retry_failed):
                         elif (previous.get('sha256') == sha and previous.get('status') in ('held', 'importing')
                               and not previous.get('retryable', False) and not retry_failed):
                             item.update(status='held', error=previous.get('error', 'interrupted_import_check_before_retry'))
+                            if previous.get('error_detail'):
+                                item['error_detail'] = previous['error_detail']
                         else:
                             packets, _ = parse(path, raw, {})  # validate before any DB writes
                             if SECRET.search(raw.decode('utf-8-sig')) or contains_possible_credential(packets):
@@ -188,6 +190,7 @@ def _sweep(root, inbox, db_path, runtime, settle_seconds, retry_failed):
                                 item.update(status='imported', **{key: result[key] for key in
                                     ('added_revisions', 'reused_messages', 'linked_entities', 'repeated_packets')})
                                 item.update(uncertain_matches=len(result['uncertain']), warnings=len(result['warnings']))
+                                item['import_status'] = result.get('import_status', 'imported')
                                 report['imported_files'] += 1
                                 report['added_revisions'] += result['added_revisions']
             except OSError as error:
@@ -202,8 +205,8 @@ def _sweep(root, inbox, db_path, runtime, settle_seconds, retry_failed):
             except sqlite3.OperationalError as error:
                 item.update(status='held', error='database_operation_failed', retryable=
                     getattr(error, 'sqlite_errorcode', None) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED))
-            except ValueError:
-                item.update(status='held', error='invalid_import_packet')
+            except ValueError as error:
+                item.update(status='held', error='invalid_import_packet', error_detail=describe_import_error(error))
             except Exception as error:
                 item.update(status='held', error='import_failed', error_type=type(error).__name__)
             if item['status'] == 'held':
