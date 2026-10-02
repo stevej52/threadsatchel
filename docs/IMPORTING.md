@@ -24,6 +24,14 @@ A threadsatchel/1 packet has kind excerpt, summary, or note, an optional title/a
 
 Omit IDs, dates, and source order you do not know. Never substitute local array positions for real source order. Keep message text exact. Label summaries separately. Split edits with the same message ID into separate packets.
 
+## Extra fields and diagnostics
+
+Additional packet and message fields are preserved unchanged as inert metadata. For example, a `provenance` or `notes` field does not reject an otherwise valid packet. Exact input bytes remain preserved. Full retrieval exposes extras inside the original packet/message metadata and separate generated `import_notes`; callers cannot overwrite those generated notices.
+
+Results add `has_warnings` and `import_status` (`imported`, `already_present`, or `imported_with_warnings`). The `extra_fields_preserved` warning identifies the structural location and field count without copying private values into logs. The usual counts still show whether any new records were added. A warning-bearing retry can say `imported_with_warnings` while adding zero records.
+
+The command returns safe structured `error_detail` for failures, and inbox sweep records that detail for invalid packets. Invalid required structure, empty message text, conflicting source IDs, nonfinite/deep metadata, unsafe temporary/executable filenames and size limits remain errors. Automatic inbox and personal connector credential checks may retain a packet for review. Extra metadata is not executed, promoted into authoritative IDs/dates, or inserted into original message text. Reuse identical content and the same request key when retrying a connector save. See [save results and troubleshooting](SAVE_RESULTS.md).
+
 ## Duplicate protection
 
 | Situation | Behavior |

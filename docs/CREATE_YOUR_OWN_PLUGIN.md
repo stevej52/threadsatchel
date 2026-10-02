@@ -63,7 +63,7 @@ Run this harmless local check from the archive folder:
 python -c "import server_readonly as s; print(s.search_memory('sample archive')); print(s.list_memories(limit=1))"
 ```
 
-You should see a sample match and a listing with `records`, `total_count`, and `next_cursor`. A missing module usually means only part of an update was copied. Keep `memory_search.py`, `memory_listing.py`, `import_metadata.py`, and the server files together.
+You should see a sample match and a listing with `records`, `total_count`, and `next_cursor`. A missing module usually means only part of an update was copied. Keep `import_memory.py`, `memory_search.py`, `memory_listing.py`, `import_metadata.py`, and the server files together.
 
 ## 2A. Build a private Sites gateway like the tested installation
 
@@ -94,7 +94,7 @@ Supply this guide and [PRIVATE_GATEWAY.md](PRIVATE_GATEWAY.md). Fill in the path
 @plugin-creator Create my personal ThreadSatchel integration using the
 existing checkout at [ABSOLUTE_ARCHIVE_FOLDER] and interpreter
 [ABSOLUTE_PYTHON_PATH]. Read docs/CREATE_YOUR_OWN_PLUGIN.md and
-docs/PRIVATE_GATEWAY.md from that checkout first.
+docs/PRIVATE_GATEWAY.md and docs/SAVE_RESULTS.md from that checkout first.
 
 Build a private Sites MCP gateway in my account and an outbound-only local
 connector. Use my existing SQLite archive and importer. Build the gateway
@@ -104,6 +104,11 @@ Implement search_memory, list_memories, get_memory, connection_status,
 get_operation, and importer-backed save_memory with stable retry keys.
 Use the documented search and pagination contracts without narrowing them.
 Start read-only; enable the save tool only after its retry tests pass.
+Align packet acceptance with the importer: preserve additional fields as
+inert metadata, return import notices, and keep core validation strict.
+Propagate safe structured importer errors and keep a bounded durable
+failure log separately from permanent success receipts. Do not log content
+or secrets. If adding recent_save_errors, authenticate and owner-scope it.
 Do not add Qwen or handoff tools unless I separately choose them.
 
 Use Sites-managed authentication and its canonical private plugin. Restrict
@@ -119,7 +124,7 @@ the exact local startup/restart instructions. Do not create a public listing
 or connect to anyone else's ThreadSatchel service.
 ```
 
-This is a build request, not a prebuilt gateway download. The builder must produce actual gateway and connector code, tests, private deployment, and local run instructions. [The companion specification](PRIVATE_GATEWAY.md) defines what those deliverables must do.
+This is a build request, not a prebuilt gateway download. The builder must produce actual gateway and connector code, tests, private deployment, and local run instructions. [The companion specification](PRIVATE_GATEWAY.md) defines what those deliverables must do. [Save results and recovery](SAVE_RESULTS.md) defines extra-field preservation, safe error propagation, diagnostic bounds, and retry behavior; these requirements apply across the gateway, connector, and importer.
 
 ### A2. Configure your instance
 
@@ -268,7 +273,7 @@ Run the checks first with synthetic data, then in a new connected chat and in Do
 4. **Pagination:** with at least 201 synthetic records, traverse every page. Verify unique IDs, stable totals, `returned_total == total_count` at the end, and final `next_cursor: null`. Retry a cursor and confirm the same membership. Check empty archives and append-between-page behavior.
 5. **Exact retrieval:** get a long original by a listed ID; its full text must survive even when the preview was truncated. A nonexistent ID should give an explicit error.
 6. **Permissions:** confirm read tools cannot write. On the private gateway, unauthenticated callers and a different account must be unable to fetch records or inspect another owner's operation.
-7. **Optional saving:** save one clearly labeled synthetic note with a unique `request_key`. Wait for a successful importer result, search and retrieve it, then repeat the identical key/packet. No second record should appear. Changed content with that key must fail.
+7. **Optional saving:** save one clearly labeled synthetic note with a unique `request_key` and extra `provenance` field. Wait for a successful importer result with an additional-field notice; retrieve exact text and preserved metadata, then repeat the identical key/packet. No second record should appear. Changed content with that key must fail. A separate invalid-core packet should fail with a safe code/location, retain its original, and create a durable bounded diagnostic entry. Verify any advertised error-history tool through this same connected client.
 8. **Recovery:** stop the connector, observe offline/pending status, then restart it and recover through the same operation/key. Never count an accepted queue entry as a completed save.
 9. **Dot:** enable the personal plugin for your Dot and repeat search, two listing pages, and retrieval. Ask Dot to report the tool names and results actually used. If you enabled saving, repeat the synthetic save check too.
 
@@ -312,6 +317,8 @@ To disconnect, disable/remove your personal plugin, stop its connector/service o
 | “No database” or unexpectedly empty archive | Resolve the server's actual source folder; it reads the database beside that file. |
 | Pending/offline operations | Check connector heartbeat, the computer's power state, protected credentials, outbound HTTPS, and the job's operation ID. |
 | A write timed out | Reuse the same key and unchanged packet; inspect the operation and importer receipt before deciding it failed. |
+| Save rejected for an extra packet field | Update all save-path layers to the [additional-field contract](SAVE_RESULTS.md), preserve the original, and retry through the same operation/key where supported. Core validation still applies. |
+| A chat reports an error but cannot find it later | Inspect the operation and the connector's durable failure log; an optional authenticated error-history tool must be implemented and exposed before the chat can query it. |
 | Large result rejected | Reduce page/search size and fetch selected originals; do not silently truncate exact originals. |
 | Cursor rejected | Restart without a cursor after a membership change; discard the incomplete scan's coverage claim. |
 | Tunnel is missing | Check organization/workspace association and Read/Use permissions, then run `doctor`. |

@@ -83,6 +83,12 @@ flowchart TD
   D --> M["Read-only MCP tools"]
 ```
 
+## Save results and extra fields
+
+Valid packets can include extra fields such as `provenance` or `notes`. The importer preserves them as inert metadata, keeps original file bytes and message text unchanged, and reports `import_status: "imported_with_warnings"` with `has_warnings: true`. Full retrieval includes generated import notes beside the preserved fields. Invalid required text, format, and identity fields still fail validation.
+
+[Save results and troubleshooting](docs/SAVE_RESULTS.md) explains the result fields, safe error details, and retry procedure. Repeat the unchanged finalized packet; a custom gateway must also reuse the same request key. Extra metadata is not automatically merged by meaning. The repository's read-only stdio server provides retrieval; remote save operations and their durable error logs require your separately built personal connector.
+
 ## Read before importing your history
 
 [Imports and duplicates](docs/IMPORTING.md) explains exact IDs, revisions, ambiguous matches, size limits, and the successfully tested OpenAI and Claude import paths. The OpenAI test included numbered conversation files and supplied voice transcripts. Attachments and unsupported content remain in preserved originals; an outer account-data ZIP needs its conversation ZIP selected explicitly. Claude imports use ThreadSatchel packets; there is no native arbitrary Claude account-export ZIP parser.
