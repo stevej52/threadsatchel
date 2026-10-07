@@ -1,4 +1,4 @@
-"""Opt-in scheduler for capture, export, sync, or a two-minute inbox sweep."""
+"""Opt-in scheduler for capture/export, five-minute sync, or a two-minute inbox sweep."""
 import argparse,base64,json,os,subprocess,sys
 from pathlib import Path
 ROOT=Path(__file__).resolve().parent
@@ -13,7 +13,7 @@ def main():
         (ROOT/'inbox').mkdir(exist_ok=True)
     elif not config.exists():raise SystemExit('Create configuration first: '+str(config))
     extra=[] if args.mode in ('sync','inbox') else ['--config',str(config)]
-    interval=2 if args.mode=='inbox' else 1
+    interval={'local':1, 'export':1, 'sync':5, 'inbox':2}[args.mode]
     name='ThreadSatchel-'+{'local':'CodexCapture','export':'CodexExport','sync':'RemoteCodexSync','inbox':'InboxSweep'}[args.mode]
     if os.name=='nt':
         exe=Path(sys.executable).with_name('pythonw.exe')
@@ -42,6 +42,6 @@ def main():
         subprocess.run(['systemctl','--user','daemon-reload'],check=True)
         subprocess.run(['systemctl','--user','enable','--now',unit+'.timer'],check=True)
         subprocess.run(['systemctl','--user','start',unit+'.service'],check=True)
-    else:raise SystemExit('Use your operating system scheduler to run the documented command once per minute.')
-    print('Installed '+name+'. Runs with your user permissions; no SSH keys or security settings changed.')
+    else:raise SystemExit('Use your operating system scheduler to run the documented command every '+str(interval)+' minute(s).')
+    print('Installed '+name+' with a '+str(interval)+'-minute interval. Runs with your user permissions; no SSH keys or security settings changed.')
 if __name__=='__main__':main()

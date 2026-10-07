@@ -21,6 +21,40 @@ The example uses an SSH alias memory-laptop and remote python3 -. For a Windows 
 
 ssh_argv is a trusted local configuration argument list, passed without a local shell. Its remote command must read Python code from stdin. Never populate it from retrieved conversation text. For jump hosts, use your existing SSH configuration or a separately reviewed relay; the public template does not embed the author's home-network route.
 
+## Scheduling and quiet operation
+
+New remote-sync schedules run every **five minutes**. Local capture and source exports still run every minute; the optional inbox sweep still runs every two minutes. Windows also syncs at sign-in, and Linux starts its user timer shortly after boot when the user manager is available.
+
+On Windows, the central sync process starts its configured SSH command without opening a console window. It still captures errors and enforces the command's timeout. This applies to the command launched directly by ThreadSatchel; a separately maintained relay that launches another SSH process must suppress that process's window too.
+
+When a source fails, only that source waits before another attempt: **10, 20, 40, then at most 60 minutes** after consecutive failures. Other sources continue on the five-minute schedule. Retry state is saved in `remote-capture/retry-state.json`, survives separate runs, and clears for a source after a successful sync. Actual retries occur at the next scheduled run after the waiting period. A manual invocation also respects a pending retry delay.
+
+Inspect `remote-capture/status.json` for each source's `sync_state` (`succeeded`, `failed`, or `waiting_to_retry`), `consecutive_failures`, and `next_retry_at` when present. Deferred sources retain their last error in the report with `deferred: true`; the command continues to exit nonzero while any source is failed or deferred. This preserves visibility of an unavailable source while avoiding repeated connections. Queued packets remain available for a later retry.
+
+### Update an existing one-minute sync schedule
+
+Updating the source files takes effect on the next run, but it does not change an already installed schedule. The installer still refuses to overwrite existing tasks or timers.
+
+For the standard Windows task, run the following as its owning Windows user. This changes only the periodic interval and retains the existing sign-in trigger, account, action, and task settings:
+
+```powershell
+$task = Get-ScheduledTask -TaskName 'ThreadSatchel-RemoteCodexSync'
+$periodic = @($task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskTimeTrigger' })
+if ($periodic.Count -ne 1) { throw 'Expected one periodic trigger; inspect this task manually.' }
+$periodic[0].Repetition.Interval = 'PT5M'
+Set-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -Trigger $task.Triggers
+```
+
+For an existing Linux user timer, run `systemctl --user edit threadsatchel-sync.timer` and add this override:
+
+```ini
+[Timer]
+OnUnitInactiveSec=
+OnUnitInactiveSec=300
+```
+
+Then run `systemctl --user daemon-reload` followed by `systemctl --user restart threadsatchel-sync.timer`. This changes the existing sync timer without changing source capture/export timers.
+
 ## Reliability
 
 Each source stores its byte cursor and filtered queue locally. A checkpoint advances after a durable queue write. The central machine verifies content hashes and imports before acknowledging source packets. Lost acknowledgements cause repeat-safe retries. Original source transcripts are never edited or deleted. Only successfully acknowledged queue packets are removed.

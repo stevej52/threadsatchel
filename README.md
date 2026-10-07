@@ -28,7 +28,7 @@ Start with the **[complete Qwen installation guide](https://github.com/stevej52/
 - Imports text, Markdown, structured conversation excerpts (including Claude material), and supported OpenAI conversation export ZIPs, including numbered JSON parts.
 - Stores full original text, provenance, source IDs, and revisions; searches with SQLite FTS5.
 - Captures supported local Codex text events incrementally, without model/API calls.
-- Can queue capture on several machines and pull it into one archive over existing SSH connections.
+- Can queue capture on several machines and pull it into one archive over existing SSH connections, with five-minute sync, hidden Windows SSH windows, and longer waits after failed syncs.
 - Makes repeated imports safe and conservatively reconciles overlapping excerpts.
 - Optionally imports completed inbox files every two minutes using the same importer.
 
