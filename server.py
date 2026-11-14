@@ -1,11 +1,14 @@
 """ThreadSatchel: a bounded, local SQLite/FTS5 MCP proof-of-concept."""
 from contextlib import closing
 from datetime import datetime, timezone
+import hashlib
+import json
 from pathlib import Path
+import re
 import sqlite3
 from uuid import uuid4
-from import_metadata import enrich
-from memory_search import search
+from memory_retrieval import compact_search, get_memory_slice, peek_memory as peek_window, timeline_memory as timeline_window
+from memory_response import bounded_auxiliary
 from memory_listing import list_records
 
 from mcp.server import MCPServer
@@ -13,6 +16,10 @@ from mcp.types import ToolAnnotations
 
 DB = Path(__file__).resolve().with_name('memory.sqlite3')
 mcp = MCPServer('ThreadSatchel')
+MAX_TEXT_BYTES = 1024 * 1024
+MAX_SOURCE_BYTES = 4096
+MAX_TITLE_BYTES = 1024
+IDEMPOTENCY_KEY = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z')
 
 
 def connect():
@@ -28,45 +35,168 @@ def initialize():
             title TEXT, created_at TEXT NOT NULL)''')
         db.execute('''CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
             id UNINDEXED, text, source, title, tokenize='unicode61')''')
+        db.execute('''CREATE TABLE IF NOT EXISTS memory_write_receipts (
+            idempotency_key TEXT PRIMARY KEY, request_sha TEXT NOT NULL,
+            memory_id TEXT NOT NULL REFERENCES memories(id))''')
+
+
+def _request_hash(text, source, title):
+    return hashlib.sha256(json.dumps([text, source, title], ensure_ascii=False,
+                                    separators=(',', ':')).encode('utf-8')).hexdigest()
+
+
+def _write_receipt(record):
+    """Confirm a write without returning another copy of the submitted text."""
+    return dict(stored=True, id=record['id'], created_at=record['created_at'],
+                text_chars=len(record['text']),
+                revision=hashlib.sha256(record['text'].encode('utf-8')).hexdigest())
+
+
+def _bounded_text(value, name, limit, optional=False):
+    if optional and value is None:
+        return
+    if not isinstance(value, str):
+        raise ValueError(name + ' must be nonempty text')
+    # Check character length before encoding to avoid allocating huge input copies.
+    if len(value) > limit or len(value.encode('utf-8')) > limit:
+        raise ValueError(name + ' exceeds the UTF-8 byte limit of ' + str(limit))
+    if not optional and not value.strip():
+        raise ValueError(name + ' must be nonempty text')
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False,
                                     idempotent_hint=False, open_world_hint=False))
-def store_memory(text: str, source: str, optional_title: str | None = None) -> dict:
-    """Persist complete original text and its source locally; return the complete record."""
-    if not text.strip() or not source.strip():
-        raise ValueError('text and source must be nonempty')
+def store_memory(text: str, source: str, optional_title: str | None = None,
+                 idempotency_key: str | None = None) -> dict:
+    """Store original text (up to 1 MiB). Reuse a caller-generated idempotency_key
+    for retries of the same write; it returns the original record, or rejects
+    changed content. Without a key, each call intentionally creates a new record.
+    """
+    _bounded_text(text, 'text', MAX_TEXT_BYTES)
+    _bounded_text(source, 'source', MAX_SOURCE_BYTES)
+    _bounded_text(optional_title, 'optional_title', MAX_TITLE_BYTES, optional=True)
+    if idempotency_key is not None and (not isinstance(idempotency_key, str) or
+                                      not IDEMPOTENCY_KEY.fullmatch(idempotency_key)):
+        raise ValueError('idempotency_key must be 1..128 ASCII letters, digits, dots, underscores, colons or hyphens, starting with a letter or digit')
+    request_sha = _request_hash(text, source, optional_title)
     record = dict(id=str(uuid4()), text=text, source=source, title=optional_title,
                   created_at=datetime.now(timezone.utc).isoformat())
     with closing(connect()) as db, db:
+        # Serialize key lookup and both inserts. A lost response can replay the
+        # committed receipt; a failed transaction leaves neither row behind.
+        db.execute('BEGIN IMMEDIATE')
+        if idempotency_key is not None:
+            receipt = db.execute('SELECT request_sha,memory_id FROM memory_write_receipts '
+                                 'WHERE idempotency_key=?', (idempotency_key,)).fetchone()
+            if receipt is not None:
+                if receipt['request_sha'] != request_sha:
+                    raise ValueError('Idempotency key already belongs to different content')
+                original = db.execute('SELECT * FROM memories WHERE id=?', (receipt['memory_id'],)).fetchone()
+                if original is None or _request_hash(original['text'], original['source'], original['title']) != request_sha:
+                    raise ValueError('Idempotency receipt no longer matches its original record')
+                return _write_receipt(dict(original))
         db.execute('INSERT INTO memories VALUES (:id,:text,:source,:title,:created_at)', record)
         db.execute('INSERT INTO memory_fts (id,text,source,title) VALUES (:id,:text,:source,:title)', record)
-    return record
+        if idempotency_key is not None:
+            db.execute('INSERT INTO memory_write_receipts VALUES (?,?,?)',
+                       (idempotency_key, request_sha, record['id']))
+    return _write_receipt(record)
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
-def search_memory(query: str, limit: int = 20, full: bool = False) -> list[dict]:
-    """Search ranked excerpts (default 20, maximum 100); full=True expands the same results to original text and provenance."""
+def search_memory(query: str, limit: int = 10, full: bool = False,
+                  budget_tokens: int = 2000) -> dict:
+    """Search a light index (default ten, max twenty). Reuse lookup_id and a
+    returned ref for exact follow-up reads within one budget. full=True stays bounded.
+    Qwen descriptions are interpretations; verify original source evidence.
+    """
     with closing(connect()) as db:
-        return search(db, Path(DB).parent, query, limit=limit, full=full)
+        return compact_search(db, Path(DB).parent, query, limit=limit,
+                              full=full, budget_tokens=budget_tokens)
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
-def list_memories(limit: int = 100, cursor: str | None = None) -> dict:
-    """List all original records in pages of 1..100 previews, independent of search. Follow next_cursor until null; total_count counts records, not AI chunks. Use get_memory(id) for full text. New arrivals join the next scan."""
+def list_memories(limit: int = 3, cursor: str | None = None,
+                  budget_tokens: int = 2000, lookup_id: str | None = None) -> dict:
+    """List budgeted original-record previews. Prefer targeted search. Follow
+    next_cursor only for requested enumeration; rows are not silently skipped.
+    """
     with closing(connect()) as db:
-        return list_records(db, limit=limit, cursor=cursor)
+        return list_records(db, limit=limit, cursor=cursor, root=Path(DB).parent,
+                            budget_tokens=budget_tokens, lookup_id=lookup_id)
+
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
-def get_memory(id: str) -> dict:
-    """Retrieve the exact original text and source plus metadata by memory ID."""
+def get_memory(id: str | None = None, revision: str | None = None,
+               block_id: str | None = None, start_char: int | None = None,
+               end_char: int | None = None, full: bool = False,
+               budget_tokens: int = 2000, lookup_id: str | None = None,
+               ref: str | None = None) -> dict:
+    """Fetch an original block/range or compact map. Offsets are zero-based
+    Unicode code points [start,end). Use a search ref plus lookup_id, or an
+    original ID and revision for exact ranges. Reuse lookup_id;
+    request only needed evidence. Full requests never bypass the budget.
+    """
     with closing(connect()) as db:
-        row = db.execute('SELECT * FROM memories WHERE id=?', (id,)).fetchone()
-        if row is None:
-            raise ValueError('Memory ID not found')
-        return enrich(db, row)
+        return get_memory_slice(db, Path(DB).parent, id, revision=revision,
+            block_id=block_id, start_char=start_char, end_char=end_char,
+            full=full, budget_tokens=budget_tokens, lookup_id=lookup_id, ref=ref)
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+def peek_memory(id: str | None = None, revision: str | None = None, match_id: str | None = None,
+                start_char: int | None = None, before: int = 500, after: int = 500,
+                budget_tokens: int = 2000, lookup_id: str | None = None,
+                ref: str | None = None) -> dict:
+    """Inspect a bounded original window. Use returned block IDs for exact
+    retrieval; never guess unseen boundaries. Reuse the search lookup_id.
+    """
+    with closing(connect()) as db:
+        return peek_window(db, Path(DB).parent, id, revision=revision,
+            match_id=match_id, start_char=start_char, before=before, after=after,
+            budget_tokens=budget_tokens, lookup_id=lookup_id, ref=ref)
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+def timeline_memory(id: str | None = None, revision: str | None = None,
+                    before: int = 3, after: int = 3, budget_tokens: int = 2000,
+                    lookup_id: str | None = None, ref: str | None = None) -> dict:
+    """Return a bounded index of nearby source messages (up to five before
+    and five after). Use it to inspect context and later corrections, then
+    fetch only needed original evidence by ref with the same lookup_id.
+    """
+    with closing(connect()) as db:
+        return timeline_window(db, Path(DB).parent, id, revision=revision,
+            before=before, after=after, budget_tokens=budget_tokens,
+            lookup_id=lookup_id, ref=ref)
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+def get_project_brief(project: str) -> dict:
+    """Read an optional local project brief with source references and freshness metadata."""
+    from ai_memory import project_brief
+    with closing(connect()) as db:
+        return bounded_auxiliary(Path(DB).parent, project_brief(Path(DB).parent, db, project))
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False))
+def memory_ai_status() -> dict:
+    """Report the optional local AI layer's configuration and current index status."""
+    from ai_memory import status
+    with closing(connect()) as db:
+        return bounded_auxiliary(Path(DB).parent, status(Path(DB).parent, db))
 
 
 if __name__ == '__main__':
     initialize()
-    mcp.run(transport='stdio')
+    try:
+        from memory_prewarm import start
+    except ImportError:
+        prewarm = None  # Core-only installations do not require optional AI files.
+    else:
+        prewarm = start(Path(DB).parent)
+    try:
+        mcp.run(transport='stdio')
+    finally:
+        if prewarm is not None:
+            prewarm.stop()

@@ -1,0 +1,6 @@
+node_modules/
+.wrangler/
+.test-build/
+.dev.vars*
+.env*
+wrangler.toml

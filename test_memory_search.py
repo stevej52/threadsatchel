@@ -166,11 +166,14 @@ class SearchTests(unittest.TestCase):
         original = self.add('one', 'SYNTHETIC amberquartz\r\nexact café text ' * 100)
         for endpoint in (server, server_readonly):
             with patch.object(endpoint, 'DB', self.path):
-                self.assertEqual(endpoint.get_memory('one'), original)
-                self.assertLessEqual(len(endpoint.search_memory('amberquartz')[0]['text']), MAX_TEXT)
-                self.assertEqual(endpoint.search_memory(query='amberquartz', limit=1, full=True), [original])
-                with self.assertRaises(ValueError):
-                    endpoint.get_memory('missing')
+                found = endpoint.search_memory('amberquartz', limit=1, full=True)
+                self.assertEqual(len(found['hits']), 1)
+                self.assertNotIn(original['text'], json.dumps(found, ensure_ascii=False))
+                saved = endpoint.get_memory(ref=found['hits'][0]['ref'],
+                    lookup_id=found['lookup_id'], start_char=10, end_char=40)
+                self.assertEqual(saved['text'], original['text'][10:40])
+                self.assertEqual(saved['lookup_id'], found['lookup_id'])
+                self.assertEqual(endpoint.get_memory('missing')['status'], 'not_found')
         with patch.object(server_readonly, 'DB', self.path), closing(server_readonly.connect()) as db:
             with self.assertRaises(sqlite3.OperationalError):
                 db.execute('DELETE FROM memories')

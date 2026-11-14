@@ -23,10 +23,10 @@ class ScheduleTests(unittest.TestCase):
         self.enterContext(contextlib.redirect_stdout(io.StringIO()))
         self.process = self.enterContext(patch.object(schedule.subprocess, 'run'))
 
-    def invoke(self, mode, platform, os_name):
+    def invoke(self, mode, platform, os_name, *args):
         fake_sys = SimpleNamespace(executable=str(self.root/'python.exe'), platform=platform)
         with patch.object(schedule, 'sys', fake_sys), patch.object(schedule, 'os', SimpleNamespace(name=os_name)), \
-             patch('sys.argv', ['install_schedule.py', mode]):
+             patch('sys.argv', ['install_schedule.py', mode, *args]):
             schedule.main()
 
     def test_windows_sync_is_five_minutes_and_retains_limited_logon_task(self):
@@ -51,6 +51,20 @@ class ScheduleTests(unittest.TestCase):
                     self.assertIn('OnBootSec=60', timer.read_text())
                     self.assertEqual(self.process.call_args.args[0],
                                      ['systemctl', '--user', 'start', 'threadsatchel-' + mode + '.service'])
+
+    def test_daily_backup_uses_explicit_destination_and_allows_long_integrity_checks(self):
+        with tempfile.TemporaryDirectory() as target:
+            options = ('--destination', target, '--keep', '3')
+            self.invoke('backup','win32','nt',*options)
+            ps = base64.b64decode(self.process.call_args.args[0][-1]).decode('utf-16-le')
+            self.assertIn('New-TimeSpan -Minutes 1440',ps)
+            self.assertIn('ExecutionTimeLimit (New-TimeSpan -Minutes 60)', ps)
+            self.assertIn('--destination',ps); self.assertIn('--keep 3',ps)
+            with patch.object(Path,'home',return_value=self.root):
+                self.invoke('backup','linux','posix',*options)
+                units = self.root/'.config/systemd/user'
+                self.assertIn('OnUnitInactiveSec=86400',(units/'threadsatchel-backup.timer').read_text())
+                self.assertIn('TimeoutStartSec=3600',(units/'threadsatchel-backup.service').read_text())
 
 if __name__ == '__main__':
     unittest.main()

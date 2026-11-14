@@ -27,7 +27,7 @@ class InboxSweepTests(unittest.TestCase):
             db.execute("INSERT INTO memories VALUES('legacy','SYNTHETIC previous memory','test',NULL,'2000-01-01')")
             db.execute("INSERT INTO memory_fts VALUES('legacy','SYNTHETIC previous memory','test',NULL)")
         migrate(self.root / 'memory.sqlite3')
-        self.raw = json.dumps({'format': 'steve-memory/1', 'kind': 'note',
+        self.raw = json.dumps({'format': 'threadsatchel/1', 'kind': 'note',
             'messages': [{'text': 'SYNTHETIC inboxsweepquartz: the blue robot carries four paper flowers.'}]}).encode()
 
     def tearDown(self):
@@ -80,7 +80,7 @@ class InboxSweepTests(unittest.TestCase):
         state['files']['good.json']['status'] = 'importing'
         state_path.write_text(json.dumps(state))
         self.assertEqual(sweep(self.root, settle_seconds=0)['already_present'], 1)
-        packet = {'format': 'steve-memory/1', 'messages': [{'text': 'SYNTHETIC token example: ' + 'sk-' + 'z' * 32}]}
+        packet = {'format': 'threadsatchel/1', 'messages': [{'text': 'SYNTHETIC token example: ' + 'sk-' + 'z' * 32}]}
         secret = self.inbox / 'sensitive.json'
         secret.write_text(json.dumps(packet))
         result = sweep(self.root, settle_seconds=0)
@@ -138,7 +138,7 @@ class InboxSweepTests(unittest.TestCase):
 
     def test_json_escaped_credential_is_held_without_logging_value(self):
         fake = 'sk-' + 'z' * 32
-        packet = {'format': 'steve-memory/1', 'messages': [{'text': 'SYNTHETIC ' + fake}]}
+        packet = {'format': 'threadsatchel/1', 'messages': [{'text': 'SYNTHETIC ' + fake}]}
         raw = json.dumps(packet).replace('sk-', '\\u0073k-').encode()
         path = self.inbox / 'escaped.json'
         path.write_bytes(raw)

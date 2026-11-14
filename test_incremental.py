@@ -13,6 +13,7 @@ import zipfile
 from mcp import Client
 from mcp.client.stdio import StdioServerParameters
 from import_memory import import_file, migrate
+from import_metadata import enrich
 
 ROOT = Path(__file__).resolve().parent
 
@@ -20,8 +21,6 @@ async def tool(client, name, **args):
     result = await client.call_tool(name,args)
     assert not result.is_error, result
     values = [json.loads(c.text) for c in result.content if c.type=='text']
-    if name=='search_memory':
-        return values
     value=values[0]
     return value['result'] if isinstance(value,dict) and set(value)=={'result'} else value
 
@@ -30,8 +29,10 @@ async def run():
     with tempfile.TemporaryDirectory(prefix='threadsatchel-synthetic-') as temp:
         root=Path(temp)
         dbpath=root/'memory.sqlite3'
-        for name in ('server.py','server_readonly.py','import_metadata.py','import_memory.py','memory_search.py','memory_listing.py'):
-            shutil.copy2(ROOT/name,root/name)
+        for source in ROOT.glob('*.py'):
+            if not source.name.startswith('test_'):
+                shutil.copy2(source, root / source.name)
+        shutil.copytree(ROOT/'connector', root/'connector', ignore=shutil.ignore_patterns('__pycache__','test_*.py'))
         with closing(sqlite3.connect(dbpath)) as db, db:
             db.execute('CREATE TABLE memories(id TEXT PRIMARY KEY,text TEXT NOT NULL,source TEXT NOT NULL,title TEXT,created_at TEXT NOT NULL)')
             db.execute("CREATE VIRTUAL TABLE memory_fts USING fts5(id UNINDEXED,text,source,title,tokenize='unicode61')")
@@ -52,11 +53,15 @@ async def run():
         assert first['added_revisions']==2
         params=StdioServerParameters(command=sys.executable,args=[str(root/'server_readonly.py')])
         async with Client(params) as client:
-            assert sorted(t.name for t in (await client.list_tools()).tools)==['get_memory','list_memories','search_memory']
+            names = {t.name for t in (await client.list_tools()).tools}
+            assert {'search_memory','get_memory','peek_memory','timeline_memory','list_memories',
+                    'get_handoff','list_handoffs','read_handoff_file'} <= names
+            assert not names.intersection({'store_memory','save_memory','save_handoff'})
             hits=await tool(client,'search_memory',query='amberquartz',full=True)
-            assert len(hits)==2
-            saved=hits[0]['id']
-            assert (await tool(client,'get_memory',id=saved))['import_metadata']['kind']=='excerpt'
+            assert hits['hits']
+            chosen=await tool(client,'get_memory',ref=hits['hits'][0]['ref'],lookup_id=hits['lookup_id'])
+            saved=chosen['id']
+            assert chosen['text'] in {m['text'] for m in json.loads(a.read_text())['messages']}
             page=await tool(client,'list_memories',limit=1)
             assert page['returned_count']==1 and page['total_count']==3 and page['next_cursor']
             last=await tool(client,'list_memories',cursor=page['next_cursor'])
@@ -101,17 +106,19 @@ async def run():
         r=import_file(p,dbpath)
         assert r['linked_entities']==1 and r['added_revisions']==0,r
         async with Client(params) as client:
-            assert len(await tool(client,'search_memory',query='bridgeword'))==1
+            assert len((await tool(client,'search_memory',query='bridgeword'))['hits'])==1
             old=await tool(client,'get_memory',id=old_id)
-            assert old['id']==old_id and old['import_metadata']['canonical_memory_id']!=old_id
-            assert len(old['import_metadata']['provenance'])==3
-            hits=await tool(client,'search_memory',query='amberquartz',full=True)
-            assert len(hits)==4,hits
+            assert old['id']==old_id and old['text']=='SYNTHETIC bridgeword'
             assert (await tool(client,'get_memory',id=saved))['id']==saved
-            edit_hit=next(h for h in hits if 'edited' in h['text'])
-            assert len(edit_hit['import_metadata']['revision_ids'])==2
-            assert edit_hit['import_metadata']['provenance'][0]['message']['source_date']=='2024-01-02T03:04:05Z'
-            assert (await tool(client,'get_memory',id='legacy-id'))==dict(id='legacy-id',text='Synthetic legacy text',source='synthetic legacy',title=None,created_at='2000-01-01')
+            assert (await tool(client,'get_memory',id='legacy-id'))['text']=='Synthetic legacy text'
+            with closing(sqlite3.connect(dbpath)) as db:
+                db.row_factory=sqlite3.Row
+                previous=enrich(db,db.execute('SELECT * FROM memories WHERE id=?',(old_id,)).fetchone())
+                assert previous['import_metadata']['canonical_memory_id']!=old_id
+                assert len(previous['import_metadata']['provenance'])==3
+                edited=enrich(db,db.execute('SELECT * FROM memories WHERE text=?',('SYNTHETIC amberquartz edited answer',)).fetchone())
+                assert len(edited['import_metadata']['revision_ids'])==2
+                assert edited['import_metadata']['provenance'][0]['message']['source_date']=='2024-01-02T03:04:05Z'
         assert import_file(renamed,dbpath)['added_revisions']==0
         passed.append('MCP restart, repeat safety, canonical linking, original IDs and provenance preserved')
         plain=root/'plain.md'
@@ -148,10 +155,11 @@ async def run():
         passed.append('Forced mid-import failure rolls back bytes, records and FTS; integrity and foreign keys pass')
         writable=StdioServerParameters(command=sys.executable,args=[str(root/'server.py')])
         async with Client(writable) as client:
-            assert sorted(t.name for t in (await client.list_tools()).tools)==['get_memory','list_memories','search_memory','store_memory']
-            stored=await tool(client,'store_memory',text='SYNTHETIC writabletool',source='SYNTHETIC TEST')
-            assert (await tool(client,'get_memory',id=stored['id']))==stored
-            assert len(await tool(client,'search_memory',query='amberquartz'))==4
+            assert {'get_memory','list_memories','search_memory','store_memory'} <= {t.name for t in (await client.list_tools()).tools}
+            args=dict(text='SYNTHETIC writabletool',source='SYNTHETIC TEST',idempotency_key='test-retry')
+            stored=await tool(client,'store_memory',**args)
+            assert (await tool(client,'store_memory',**args))==stored
+            assert (await tool(client,'get_memory',id=stored['id']))['text']==args['text']
         passed.append('Existing writable MCP tools and store contract preserved')
     report=dict(status='PASS',tests=passed,fixtures='Clearly labeled synthetic data; isolated temporary database removed',actual_export_validation='This suite uses synthetic fixtures; see docs/IMPORTING.md for the separately verified real export.')
     (ROOT/'incremental-test-results.json').write_text(json.dumps(report,indent=2),encoding='utf-8')

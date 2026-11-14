@@ -49,7 +49,7 @@ For anonymous-to-export reconciliation, the excerpt must contain at least two me
 
 The importer reports added_revisions, reused_messages, repeated_packets, linked_entities, uncertain, warnings, and (when reconciliation runs) ambiguous_excerpt_packets. Review warnings and ambiguous cases; do not interpret them as fully resolved coverage.
 
-Deduplication reduces duplicate searchable records. It does not delete original source archives: raw inputs, provenance, and revisions consume space intentionally. This is not a storage compactor. `store_memory` on the optional writable MCP endpoint is append-only and does not perform conversation reconciliation. Prefer the importer for repeat-safe conversation delivery. See [the writable tool contract](CONNECTING.md) and the separately built gateway's [save protocol](PRIVATE_GATEWAY.md#durable-save-sequence).
+Deduplication reduces duplicate searchable records. It does not delete original source archives: raw inputs, provenance, and revisions consume space intentionally. This is not a storage compactor. `store_memory` on the optional writable MCP endpoint appends a record and supports retry protection with an idempotency key. It does not perform conversation reconciliation. Prefer the importer for repeat-safe conversation delivery. See [the writable tool contract](CONNECTING.md) and the [gateway save protocol](PRIVATE_GATEWAY.md).
 
 ## OpenAI ZIP status
 
@@ -59,15 +59,13 @@ It retains current-branch text and other branch records with their recorded conv
 
 Some official account-data downloads are outer ZIPs containing a separate conversation ZIP alongside profile/billing exports. The outer wrapper is not automatically unpacked or imported. Preserve it, inspect its member list, copy only the reviewed conversation ZIP to a safe generated local filename, and import that ZIP after backup and validation on a database copy. Do not bulk-extract or execute archive contents or assume that account/billing files belong in searchable conversation memory.
 
-A full real OpenAI conversation export (the memory dump) was successfully imported into the author's archive on September 28, 2026, after validation on a copy. It included numbered conversation parts and provided voice transcripts. A full repeat import added zero new records, and imported originals were retrieved through MCP. This validates the observed layout, not every past or future export format. Before your first full export, keep its original unchanged, make a SQLite online backup, inspect its actual schema, and validate on a copy of your archive.
+The importer supports numbered conversation parts and supplied voice transcripts. Before a large import, preserve the source ZIP, back up SQLite, and validate the export on a copy. Repeating an unchanged import should add zero revisions.
 
 “Full export imported” refers to processing the conversation export, preserving the supplied ZIP, and indexing its supported text. It does not mean every attachment, unsupported multimodal item, or outer billing/account file became searchable. Review the import warnings for the exact coverage.
 
 Exact text shared with a prior anonymous capture can remain separately searchable when the source identity or required full sequence cannot be verified. A successful repeat-import test establishes retry safety; it does not prove that all earlier summaries or partial manual captures have been reconciled. Review such overlap without merging unrelated conversations or inventing source IDs.
 
 ## Claude imports: working packet workflow
-
-Claude conversation material is being successfully imported. A September 29, 2026 delivery check verified nine files containing 893 records: 845 conversation messages and 48 summaries/notes. All stored text and metadata matched the delivered files, all records were indexed, and that batch had no import warnings, missing records, or held files.
 
 The tested path uses Claude material exported or converted to `threadsatchel/1` packets. There is no native parser for an arbitrary Claude account-export ZIP. Do not pass a raw Claude ZIP to the OpenAI ZIP parser and assume it will work.
 
@@ -104,7 +102,7 @@ I asked not to save. Validate the packets and use the existing authorized
 import path, then verify exact stored text before claiming success.
 ```
 
-The core importer's legacy `steve-memory/1` compatibility remains for older packets; new generic integrations should emit `threadsatchel/1`. The import check does not imply automatic access to all Claude chats.
+New packets use `threadsatchel/1`. The importer also recognizes historical site-specific version 1 memory namespaces and reuses matching existing packet keys. The import check does not imply automatic access to all Claude chats.
 
 ## Safe direct delivery
 

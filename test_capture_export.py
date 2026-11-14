@@ -21,6 +21,15 @@ def run():
         p.write_bytes(data([meta(),msg('u1','Synthetic export request'),msg('a1','Synthetic export answer','AgentMessage'),msg('u2','Synthetic appended')]))
         assert cap.run(cfg)['counts']['eligible_messages']==1
         assert len(transport.pending(root/'queue')['packets'])==1
+        corrupt = root/'queue'/'packets'/('0'*64+'.json')
+        corrupt.write_bytes(b'fixture')
+        bundle = transport.pending(root/'queue')
+        assert len(bundle['packets'])==1 and bundle['status']['transport_held_count']==1
+        assert bundle['status']['transport_held'][0]['reason']=='queue_hash_mismatch'
+        try:transport.acknowledge(root/'queue',[corrupt.stem])
+        except ValueError:pass
+        else:raise AssertionError('Corrupt queued bytes were acknowledged')
+        assert corrupt.exists()
         cfg['source_roots']=[str(root/'absent')];assert not cap.run(cfg)['errors']
     print('PASS: durable queue, repeat before/after acknowledgement, append, empty roots, invalid acknowledgement')
 if __name__=='__main__':run()

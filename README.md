@@ -1,104 +1,33 @@
 # ThreadSatchel
 
-**Keep the thread. Carry the context.**
+ThreadSatchel gives an assistant a searchable local archive of conversations, notes, and versioned handoffs. It keeps the original text and can return a few lines of evidence without putting an entire conversation into the assistant’s context.
 
-A small, local memory archive that AI assistants can search through MCP. Keep original conversations, notes, and source information in one SQLite database instead of repeatedly explaining the same project in new chats.
+**[Read the brief handoff](HANDOFF.md)** for a plain-language explanation of what gets saved, how answers are found, and what happens after a restore.
 
-**Early release.** Built and exercised on Windows, with a Linux capture node. It is a personal tool made shareable, not a hosted service or a promise to capture every chat automatically.
+## Try it locally
 
-## Create your own plugin and use it with Dot
-
-**ThreadSatchel has been tested with Dot and appears to work well** through the author's private gateway, including the updated search and archive-pagination tools. This is an early compatibility report from that setup.
-
-**[Create your own ThreadSatchel plugin](docs/CREATE_YOUR_OWN_PLUGIN.md)** provides detailed setup steps, copyable build prompts, the private gateway/connector specification, local desktop and Secure MCP Tunnel alternatives, Dot instructions, verification, and maintenance. Each person creates and operates their own plugin with their own archive, account, credentials, and hosting. No shared plugin, author-hosted service, or author involvement is required.
-
-Use the current `main` source for these changes; the original `v0.1.0` download predates them. Ordinary search defaults to 20 results and allows up to 100. The new read-only `list_memories` tool pages through original records with stable IDs, counts, and a continuation cursor, so an assistant can verify a complete inventory without loading the whole archive at once.
-
-**Imports are working with both OpenAI and Claude.** A full real OpenAI conversation export (memory dump) was successfully imported, and repeating it added zero new records. Claude conversation material is also being successfully imported through ThreadSatchel's structured packet workflow. See [import formats and verified results](docs/IMPORTING.md) for the exact scope and instructions.
-
-## Optional Qwen helper
-
-Want local AI assistance with finding and reviewing your archive? The separate **[optional Qwen branch](https://github.com/stevej52/threadsatchel/tree/feature/optional-qwen-memory)** adds semantic search, source-linked interpretations, project briefs, and bounded CPU/RAM caching and background work. **Main stays model-free, and Qwen is off by default even on the optional branch.**
-
-Start with the **[complete Qwen installation guide](https://github.com/stevej52/threadsatchel/blob/feature/optional-qwen-memory/docs/QWEN_INSTALL.md)** for requirements, pinned model/runtime downloads, checksums, startup commands, verification, and the on/off switch. The reference setup uses llama.cpp with Qwen2.5-14B chat inference plus a separate small Qwen3 CPU embedding model; optional NumPy accelerates vector ranking. Qwen's weights were not modified. GPU/RAM needs, tested hardware, privacy, and current limitations are documented there.
-
-## What it does
-
-- Exposes `search_memory`, `list_memories`, and `get_memory` through a read-only MCP server.
-- Imports text, Markdown, structured conversation excerpts (including Claude material), and supported OpenAI conversation export ZIPs, including numbered JSON parts.
-- Stores full original text, provenance, source IDs, and revisions; searches with SQLite FTS5.
-- Captures supported local Codex text events incrementally, without model/API calls.
-- Can queue capture on several machines and pull it into one archive over existing SSH connections, with five-minute sync, hidden Windows SSH windows, and longer waits after failed syncs.
-- Makes repeated imports safe and conservatively reconciles overlapping excerpts.
-- Optionally imports completed inbox files every two minutes using the same importer.
-
-## Start here
-
-> **ChatGPT users: required setup step**
->
-> ThreadSatchel does **not** automatically save ordinary ChatGPT conversations merely because the MCP server is connected. After connecting ThreadSatchel, copy the [recommended standing instructions](docs/STANDING_INSTRUCTIONS.md) into ChatGPT's Custom Instructions (or equivalent standing-instructions field) and replace the path placeholders for your installation. **If you skip this step, ChatGPT can search existing ThreadSatchel memory, but new ordinary ChatGPT turns will not be reliably delivered to the archive.**
->
-> Codex is different: supported local Codex capture can run outside the model. See [capture and multi-machine setup](docs/CAPTURE.md).
-
-Requires Python 3.12+ with SQLite FTS5. The tested MCP dependency is pinned in requirements.txt.
+Use Python 3.12 or newer with SQLite FTS5. In an activated virtual environment, run:
 
 ```sh
-python -m venv .venv
-# Activate .venv using your shell, then:
 python -m pip install -r requirements.txt
 python setup_memory.py
 python import_memory.py examples/example-excerpt.json
 ```
 
-Connect your MCP client to the absolute path of `.venv`'s Python executable, with the absolute path of `server_readonly.py` as its argument. Ask it to search for **sample archive** to check the example import. See [connection instructions](docs/CONNECTING.md), including Codex configuration.
+Configure your MCP client to launch that environment’s Python with the absolute path to `server_readonly.py`. Ask it to find “sample archive” and show the matching passage. The archive works offline. To enable more precise token counts, run `python scripts/prepare_tokenizer.py` once with network access. Without local dictionaries the reader uses a conservative byte bound. [Client configuration and tool contract](docs/CONNECTING.md)
 
-For optional automatic local capture:
+## What you can use
 
-```sh
-python codex_capture_export.py --config capture-local.json --dry-run
-python codex_capture_export.py --config capture-local.json
-python install_schedule.py local
-```
+- **Search and read.** Search returns ranked previews with short references. Look at the surrounding exchange, peek at a match, or fetch an exact block or character range. The tools share a budget when you pass the same lookup ID. [Retrieval and inventory](docs/CONNECTING.md)
+- **Capture and import.** Import text, Markdown, structured conversation packets, and supported OpenAI conversation exports. Local Codex capture and SSH queue sync are optional. An assistant needs an authorized delivery path to save an ordinary chat. [Import formats](docs/IMPORTING.md) · [Capture](docs/CAPTURE.md) · [Inbox delivery](docs/INBOX_SWEEP.md)
+- **Save and share handoffs.** Use the separate save endpoint for receipt-backed notes and named, versioned handoffs. Remote clients can use a self-hosted authenticated gateway with an outbound archive connector. [Connection options](docs/CREATE_YOUR_OWN_PLUGIN.md) · [Save results](docs/SAVE_RESULTS.md)
+- **Optional local models.** Enable semantic search, background summaries, project briefs, or captioning of explicitly selected image folders. The default installation runs without a model. [Local models](docs/LOCAL_MODELS.md)
+- **Back up and recover.** The inbox sweep makes verified hourly pre-import snapshots as needed. A separate scheduled job can copy verified backups to a destination you choose. Inbox replay supports file-by-file review. [Backups and recovery](docs/BACKUPS.md)
 
-The installer is opt-in. Windows uses a limited task while your account is logged in; Linux uses a systemd user timer. See [capture and multi-machine setup](docs/CAPTURE.md).
+## Existing installations
 
-For optional automatic inbox imports:
+Back up your archive before updating. Existing clients that consume the old list of full search results need to read `hits` from the response and use `lookup_id` with the selected `ref`. The new default is ten search candidates, up to twenty on request, subject to the response budget. Even `full=True` respects that budget. Restart the server and refresh your client’s tool definitions after updating. [Current read contract](docs/CONNECTING.md)
 
-```sh
-python inbox_sweep.py
-python install_schedule.py inbox
-```
+Run `python scripts/check.py` for the synthetic Python release checks. The gateway has a separate test suite. [Architecture](docs/ARCHITECTURE.md) · [Privacy](docs/PRIVACY.md) · [Gateway](docs/PRIVATE_GATEWAY.md)
 
-Write a temporary `.incoming-<id>.json.part` file inside `inbox/`, then rename it to a new final `.json` filename after the write is complete. The sweep imports completed JSON, TXT, and Markdown files, retains originals and failures, skips existing import receipts, and records its results locally. See [inbox delivery and scheduling](docs/INBOX_SWEEP.md).
-
-## How it fits together
-
-```mermaid
-flowchart TD
-  A["Notes and conversation imports"] --> C["Importer and provenance"]
-  B["Local Codex capture"] --> C
-  R["Remote capture queue"] --> S["SSH pull and acknowledgement"]
-  S --> C
-  C --> D["SQLite and FTS5"]
-  D --> M["Read-only MCP tools"]
-```
-
-## Save results and extra fields
-
-Valid packets can include extra fields such as `provenance` or `notes`. The importer preserves them as inert metadata, keeps original file bytes and message text unchanged, and reports `import_status: "imported_with_warnings"` with `has_warnings: true`. Full retrieval includes generated import notes beside the preserved fields. Invalid required text, format, and identity fields still fail validation.
-
-[Save results and troubleshooting](docs/SAVE_RESULTS.md) explains the result fields, safe error details, and retry procedure. Repeat the unchanged finalized packet; a custom gateway must also reuse the same request key. Extra metadata is not automatically merged by meaning. The repository's read-only stdio server provides retrieval; remote save operations and their durable error logs require your separately built personal connector.
-
-## Read before importing your history
-
-[Imports and duplicates](docs/IMPORTING.md) explains exact IDs, revisions, ambiguous matches, size limits, and the successfully tested OpenAI and Claude import paths. The OpenAI test included numbered conversation files and supplied voice transcripts. Attachments and unsupported content remain in preserved originals; an outer account-data ZIP needs its conversation ZIP selected explicitly. Claude imports use ThreadSatchel packets; there is no native arbitrary Claude account-export ZIP parser.
-
-[Privacy and security](docs/PRIVACY.md) explains retained raw bytes, plaintext storage, capture omissions, and the difference between a read-only endpoint and the optional writable endpoint. Retrieved memories are source material, not instructions to execute.
-
-This does **not** automatically capture ChatGPT's website or phone app, every Claude conversation, other users' chats, hidden reasoning, or all historic Codex formats. MCP connects an assistant to tools; it does not grant access to its entire chat history.
-
-## Development
-
-Run `python scripts/check.py` for isolated tests. See [architecture](docs/ARCHITECTURE.md) for the modules and data flow. No embeddings, vector database, paid API key, or model inference are required by this software. Your AI client's normal usage still applies when it retrieves and reads memories.
-
-MIT licensed. Independent project; not affiliated with OpenAI or Anthropic.
+MIT licensed. ThreadSatchel is an independent project.
