@@ -28,9 +28,9 @@ class DirectDeliveryTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.inbox = self.root / 'inbox'
         self.inbox.mkdir()
-        shutil.copy2(ROOT / 'import_memory.py', self.root / 'import_memory.py')
-        for name in ('server_readonly.py', 'import_metadata.py', 'memory_search.py', 'memory_listing.py'):
-            shutil.copy2(SOURCE / name, self.root / name)
+        for source in SOURCE.glob('*.py'):
+            if not source.name.startswith('test_'):
+                shutil.copy2(source, self.root / source.name)
         with closing(sqlite3.connect(self.root / 'memory.sqlite3')) as db, db:
             db.execute('CREATE TABLE memories(id TEXT PRIMARY KEY,text TEXT NOT NULL,source TEXT NOT NULL,title TEXT,created_at TEXT NOT NULL)')
             db.execute("CREATE VIRTUAL TABLE memory_fts USING fts5(id UNINDEXED,text,source,title,tokenize='unicode61')")
@@ -51,7 +51,7 @@ class DirectDeliveryTests(unittest.TestCase):
             return db.execute('SELECT COUNT(*) FROM memories').fetchone()[0]
 
     def test_legacy_and_public_format_share_identity(self):
-        for index, marker in enumerate(('steve-memory/1', 'threadsatchel/1')):
+        for index, marker in enumerate(('fixture-memory/1', 'threadsatchel/1')):
             packet = json.loads(RAW)
             packet['format'] = marker
             path = self.inbox / ('format-' + str(index) + '.json')
@@ -113,8 +113,10 @@ class DirectDeliveryTests(unittest.TestCase):
                 self.assertFalse(found.is_error)
                 records = [json.loads(c.text) for c in found.content if c.type == 'text']
                 self.assertEqual(len(records), 1)
-                self.assertEqual(records[0]['text'], TEXT)
-                exact = await client.call_tool('get_memory', {'id': records[0]['id']})
+                page = records[0].get('result', records[0])
+                self.assertEqual(len(page['hits']), 1)
+                exact = await client.call_tool('get_memory', {'ref': page['hits'][0]['ref'],
+                                                               'lookup_id': page['lookup_id']})
                 self.assertFalse(exact.is_error)
                 result = json.loads(next(c.text for c in exact.content if c.type == 'text'))
                 result = result.get('result', result)

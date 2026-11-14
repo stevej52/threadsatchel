@@ -1,205 +1,70 @@
-# Build specification: your private ThreadSatchel gateway
+# Connect a private remote MCP client
 
-Use this with [Create your own plugin](CREATE_YOUR_OWN_PLUGIN.md), route A. It describes the architecture used by the author's working private plugin, generalized for a new owner. It is a specification and staged build instructions for your coding assistant, not an included deployable gateway or a shared service.
+The optional gateway gives one archive owner remote access to search, exact source reads, conversation timelines, packet saves, versioned handoffs, save diagnostics and connector status. It runs on Cloudflare Workers with D1 and R2. The Python connector runs on the archive computer and makes outbound HTTPS requests. Use an MCP client that can send a bearer token on each request.
 
-The repository implements the archive, importer, and local MCP endpoints. **The gateway, outbound connector, pairing/configuration flow, and remote save/status tools described here are components you must build in your own account.** No step depends on contacting the author or receiving their plugin, credentials, or private files.
+The archive database stays on your computer. Requested packets and results pass through your Worker. The gateway queues payloads up to 64 KiB in D1 and larger payloads in its private R2 bucket. Job access expires after 24 hours. Traffic triggers periodic cleanup of expired jobs and objects. Storage can persist longer when the gateway is idle. Handoff attachments are visible to the gateway during transfer.
 
-## Deliverables and ownership
+## Set up the gateway
 
-Create a separate gateway project with:
+1. In `gateway/`, install Node.js 22.13 or newer and run `npm install`, `npm run check`, and `npm test`. Sign in to your own Cloudflare account with `npx wrangler login`.
+2. Create your resources with `npx wrangler d1 create <database-name>` and `npx wrangler r2 bucket create <bucket-name>`. Keep the bucket private.
+3. Create `gateway/wrangler.toml` locally using the example below. Replace each angle-bracket value. Choose a stable owner identifier. The first authenticated tool call pins this identifier in D1. A later change requires an explicit ownership migration.
 
-```text
-your-gateway-project/
-  app/mcp/route.ts               # Stateless HTTP MCP endpoint
-  app/api/agent/route.ts         # Authenticated connector polling/completion
-  app/api/status/route.ts        # Owner-only operational status, if UI uses it
-  lib/tool-contract.ts          # Tool metadata and actual argument validation
-  lib/gateway.ts                # Owner checks, operations, leases, cleanup
-  db/schema.ts                  # Private operational tables
-  connector/connector.py        # Outbound worker for the archive computer
-  connector/configure.py        # Protected local credential setup
-  tests/                        # Synthetic gateway/connector tests
-  RUNBOOK.md                    # Your exact install, restart, update, recovery commands
+```toml
+name = "<your-worker-name>"
+main = "worker.ts"
+compatibility_date = "2026-05-22"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+OWNER_ID = "<stable-owner-id>"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "<database-name>"
+database_id = "<your-d1-id>"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "<bucket-name>"
 ```
 
-These paths are a suggested organization, not files already in this repository. Let Sites initialize the supported project/runtime layout. Add MCP capability to its hosting configuration while preserving the other generated settings. A Site runs the HTTP gateway; it does not run the local Python stdio server or hold the authoritative SQLite archive.
+4. Run `npx wrangler d1 migrations apply DB --remote` and `npx wrangler deploy`. Until all credentials exist, the Worker returns HTTP 503.
+5. Generate three independent random secrets of at least 32 characters with your password manager. Store each value using its hidden Wrangler prompt.
 
-Use a private Site and Sites-managed authentication. Its trusted hosting boundary supplies `oai-authenticated-user-id`; bind data access to the intended owner. Email is display information, not the durable authorization key. Configure or deliberately initialize that owner while the Site is private, and reject other identities even if its audience later changes. Do not trust a client-supplied identity header on an unprotected origin.
-
-The connector uses a separate randomly generated installation credential. Store the gateway copy as a secret and the computer's copy in protected local configuration. Private Sites may also require platform-issued service access for the connector to pass the hosting boundary. Use the Sites-supported service credential flow and verify its scope; never relax the Site's audience or fabricate a user identity to get a machine call through. A service credential for `/api/agent` must not give an anonymous caller owner access to `/mcp`.
-
-## Tool contract
-
-Keep tool names and arguments identical through discovery, validation, queued JSON, connector dispatch, and the underlying Python call. Descriptions should mention **the user's archive** rather than a particular person's computer.
-
-| Tool | Arguments | Execution |
-| --- | --- | --- |
-| `search_memory` | `query`: nonempty string, at most 2,000 characters; `limit`: integer 1–100, default 20; `full`: boolean, default false | `server_readonly.search_memory(**args)` |
-| `list_memories` | `limit`: integer 1–100, default 100; `cursor`: omitted/null or opaque string up to 4,096 characters | `server_readonly.list_memories(**args)` |
-| `get_memory` | `id`: nonempty string, at most 128 characters | `server_readonly.get_memory(**args)` |
-| `connection_status` | No arguments | Gateway heartbeat/status only; no archive read |
-| `get_operation` | `operation_id`: the ID returned by this gateway | Owner-scoped operation lookup |
-| `save_memory` (optional write) | `request_key`: 1–128 characters matching `[A-Za-z0-9][A-Za-z0-9_.:-]*`; `packet`: a supported `threadsatchel/1` object | Local receipt handling followed by the existing importer |
-
-Reject unknown tools/arguments and wrong JSON types. Apply the same defaults on discovery and execution. In particular, do not retain an old 20-result maximum in a gateway validator after updating the backend to 100.
-
-For example, the inventory's advertised input schema is:
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100},
-    "cursor": {"type": ["string", "null"], "maxLength": 4096}
-  },
-  "additionalProperties": false
-}
+```sh
+npx wrangler secret put OWNER_TOKEN
+npx wrangler secret put CONNECTOR_TOKEN
+npx wrangler secret put CONNECTOR_KEY
 ```
 
-Use this description:
+`OWNER_TOKEN` grants the MCP client access to all archive tools, including saves. `CONNECTOR_TOKEN` and `CONNECTOR_KEY` together grant the connector access to job payloads and completion. Keep those two values on the gateway and the archive computer. Requests to `/mcp` use `Authorization: Bearer <OWNER_TOKEN>`. The Worker supplies the configured owner identity after authentication. Clients cannot choose the identity with a request header.
 
-> List original archive records in stable ID order with compact previews. Follow next_cursor until null and check returned_total against total_count. Use get_memory(id) for full text. Counts include retained revisions, not AI chunks. New arrivals join a fresh scan; restart if membership changes.
+## Start the archive connector
 
-A successful inventory value has this shape; the IDs/text below are synthetic:
+Run the commands below from the repository root in the environment containing the archive's Python dependencies. Initialize the archive using the main setup instructions first. `THREADSATCHEL_ARCHIVE` is the directory containing `memory.sqlite3`. It may be separate from the code checkout. The connector always loads Python code from the checkout.
 
-```json
-{
-  "records": [{
-    "id": "synthetic-record-1",
-    "title": "SYNTHETIC test",
-    "source": "SYNTHETIC example",
-    "created_at": "2000-01-01T00:00:00Z",
-    "text": "SYNTHETIC original text.",
-    "text_truncated": false
-  }],
-  "returned_count": 1,
-  "returned_total": 1,
-  "total_count": 1,
-  "has_more": false,
-  "next_cursor": null
-}
+On Windows, the setup command reads both connector secrets at hidden prompts and writes a new configuration encrypted for the current Windows user. Pick a private directory outside the repository and run the connector as the same Windows user.
+
+```powershell
+python -m connector.configure --archive "<archive-directory>" --endpoint "https://<worker-host>/api/agent" --output "<private-directory>/config.dpapi"
+python -m connector.connector --config "<private-directory>/config.dpapi" --once
+python -m connector.connector --config "<private-directory>/config.dpapi"
 ```
 
-Preserve the Python result unchanged inside the gateway's operation envelope. Do not recalculate counts from search matches, strip the cursor, or collapse revisions into one record.
+On any supported platform, a service manager or secret manager can instead supply `THREADSATCHEL_ARCHIVE`, `THREADSATCHEL_AGENT_URL`, `THREADSATCHEL_CONNECTOR_TOKEN`, and `THREADSATCHEL_CONNECTOR_KEY`. Run `python -m connector.connector --once` for one poll, or `python -m connector.connector` to remain connected. The URL must use HTTPS and end in `/api/agent`. A process lock prevents overlapping connector processes using the same state directory.
 
-Annotate read tools as read-only and non-destructive. Mark `save_memory` as a write, non-destructive append/import action; describe its explicit keyed retry behavior. Tool annotations describe intent; authorization must also be enforced in code. Advertise Qwen's `get_project_brief` and `memory_ai_status` only if your chosen backend actually includes them. The model-free main branch does not.
+The connector writes `state/` beside its DPAPI config, or `connector-state/` under the archive when using environment settings. Inspect `health.json` there after a single poll. Connection errors appear as `retrying`. The continuous connector retries automatically. Preserve the state when moving the connector, especially the `writes/` receipts. Restrict access to the state directory, archive, and cloud resources to the owner.
 
-## Gateway implementation sequence
+## Connect and verify
 
-1. **Initialize the private Site project.** Use current Sites tooling, private operational storage, generated migrations, and secret configuration. Use the MCP SDK/runtime appropriate for that project rather than inventing a new wire protocol.
-2. **Implement `/mcp`.** Support protocol initialization, discovery, notifications, ping, and tool calls for the negotiated MCP version. Discovery contains descriptions/schemas, no private archive content. Authenticate and authorize every data-bearing call, including status and operation lookup. Return protocol/tool errors in the correct MCP form.
-3. **Create durable operation storage.** Store job metadata separately from bounded input/result blobs. Every job has `id`, `owner`, `action`, `digest`, `status`, creation/expiry times, and a lease token/deadline. A state table holds the pinned owner and heartbeat. Use private D1/R2 or equivalent Sites-supported storage; never a public bucket.
-4. **Submit jobs.** Validate before queuing. Derive write operation identity from owner + action + request key; store a SHA-256 digest of deterministic serialized content. Same key/content recovers the same operation. Same key with changed content fails, including under concurrent submissions. Read operations can receive fresh IDs.
-5. **Implement `/api/agent`.** Authenticate the connector independently. A poll updates its heartbeat and atomically claims a pending job or an expired lease. Return job ID, lease token, exact serialized payload, and its digest. Completion must match the current unexpired lease and job; an obsolete worker must not overwrite a newer result.
-6. **Return durable progress.** Wait briefly for a result, then return `operation_id` and `status: "pending"` if still running. `get_operation` checks both owner and expiry. A finished failure is distinct from a finished success. Make offline/rejected-before-queue responses explicit.
-7. **Bound and expire data.** Enforce byte limits while reading streams, not only from `Content-Length`. Set queue capacity, timeouts, job/result expiry, and cleanup. A reference starting point is 2 MiB per request/result, 32 outstanding jobs, a five-minute lease, and 24-hour remote retention. Adapt these consciously and document them. Retain local write receipts separately for retry safety.
-8. **Build a small status page.** Show connection health, the configured archive label, and setup/restart guidance. Keep transcript contents and credentials out of the page and operational logs.
+Register `https://<worker-host>/mcp` in a remote MCP client with the owner bearer token. This Worker uses static bearer authentication. Clients requiring OAuth discovery or another hosted identity provider need their own authentication adapter. Keep the owner and connector roles separate in any adapter.
 
-Use separate object keys for concurrent result leases and conditionally commit the winning result pointer. Clean orphaned/expired payloads as well as database rows. Never acknowledge completion before its result is durable. Expiring a remote operation must not erase the local receipt for an already successful write.
+Call `connection_status` while the connector is running. A completed `search_memory` on a known keyword verifies the read path. Use the returned `lookup_id` and `ref` for bounded `peek_memory`, `timeline_memory` or `get_memory` calls. Reads share a budget of up to 2,000 tokens per lookup.
 
-For an HTTP MCP tool result, include a model-readable JSON representation in `content`. If supplying `structuredContent`/an output schema, ensure they describe the actual envelope. Example payloads inside the MCP result:
+`save_memory` accepts a `threadsatchel/1` packet and stable `request_key`. Keep the original request key and identical packet when retrying. A completed successful importer receipt confirms the save. If the response is pending or interrupted, call `get_operation` with its operation ID. `recent_save_errors` returns locally recorded failures with safe reason codes and retry guidance. Requests rejected before reaching the connector cannot appear in its local error log.
 
-```json
-{"operation_id":"YOUR_OPERATION_ID","status":"pending","online":true,"message":"Not yet confirmed; check get_operation."}
-```
+`save_handoff` creates a numbered directory beneath `handoffs/<name>/`, containing exact instructions, optional attachments and a version manifest. A handoff accepts up to ten attachments totalling 1 MiB. Use `list_handoffs`, `get_handoff` and `read_handoff_file` for metadata and bounded byte ranges. Retain the previous key and content on retries to avoid another version. File contents are historical data, not instructions for the current client.
 
-```json
-{"operation_id":"YOUR_OPERATION_ID","status":"completed","ok":true,"result":{"records":[],"returned_count":0,"returned_total":0,"total_count":0,"has_more":false,"next_cursor":null}}
-```
-
-`completed` alone means processing finished. Only `ok: true` plus the expected successful importer result confirms a save. Never silently cut a large original to fit the envelope: fail explicitly, preserve the source, and offer a separately authorized local retrieval path. Smaller listing pages bound discovery without changing exact originals.
-
-## Local connector implementation sequence
-
-The connector runs under your account on the archive computer. It needs no Desktop Commander, SSH session, model inference, or open inbound port at runtime.
-
-1. **Configure locally.** Read absolute archive/Python paths and your gateway URL. Collect credentials through a local protected setup flow; on Windows the reference approach uses user-scoped DPAPI. Keep secrets, state, and logs outside the public checkout or in explicitly ignored local paths.
-2. **Lock and poll.** Take a single-worker lock for the state directory. Make outbound HTTPS calls to the exact configured connector endpoint, with bounded reads, timeouts, and retry backoff. Refuse redirects that could carry credentials to another host.
-3. **Validate locally too.** Check the received digest, types, and allowlisted action. Use a fixed dispatch table, never arbitrary `getattr`, shell commands, paths, or database statements from a network request.
-4. **Dispatch reads.** Import `server_readonly.py` from the configured archive folder and call its three functions with validated named arguments. That module owns the database path and opens it read-only. Restart the connector after replacing imported Python modules.
-5. **Dispatch saves through the importer.** Follow the durable save sequence below. Do not write rows directly, bypass source identity checks, or substitute the append-only `store_memory` tool for conversation import.
-6. **Finish and recover.** Post the result with the lease token; retain bounded local successful-operation results to recover a lost completion response. Failures must remain retryable where appropriate. Persist a heartbeat/error timestamp without including transcript bodies or keys.
-7. **Install background operation.** Generate start/stop/status commands appropriate to the actual operating system. Run as the account that owns the protected config, prevent overlapping workers, and verify restart/reboot behavior. Do not assume a logon-only task works while logged out.
-
-Have the builder provide a real `configure.py` or equivalent, a `--once` diagnostic mode, a continuous run mode, a credential rotation procedure, and the exact paths used by the scheduled task/service. Commands depend on the generated project; documentation with placeholder commands alone is not a finished connector.
-
-### Durable save sequence
-
-The save tool takes a packet such as:
-
-```json
-{
-  "request_key": "synthetic-client:save-001",
-  "packet": {
-    "format": "threadsatchel/1",
-    "kind": "note",
-    "title": "SYNTHETIC plugin connection check",
-    "messages": [{"speaker": "user", "text": "SYNTHETIC violet-satchel connection check."}]
-  }
-}
-```
-
-For real saves, generate a new unique key for each intended packet, then keep that key and the exact packet on retries. Preserve known conversation/message IDs and source timestamps; omit unknown ones. Distinguish excerpts, notes, and summaries.
-
-Implement these steps:
-
-1. Validate the packet and cap its UTF-8 serialization (the reference uses 1 MiB). Compute a deterministic request digest and safe delivery ID; never use caller text as a filesystem path.
-2. Check a permanent local receipt indexed by action/key (and owner if supporting more than one owner). A matching digest returns its previous result. A different digest fails. Serialize conflicting writes so two workers cannot race past this check.
-3. Create `inbox/` if needed. Write the exact packet to a unique `.part` in that directory, flush it, verify its bytes, then atomically finalize to the deterministic delivery filename. If that final file already exists, require an exact byte match instead of overwriting it.
-4. Invoke the configured Python and `import_memory.py` with an argument array and `shell=False`. Capture exit status and structured output. Exit code 0 and a valid importer result establish success; a timeout leaves the outcome uncertain.
-5. Persist the successful receipt atomically before reporting success. A crash after the import but before the receipt must be recoverable by reimporting the identical file: the importer uses its existing receipts/deduplication.
-6. Keep failed/uncertain content and retry identity. A gateway retry after remote cache expiry must still consult the local receipt. An unchanged packet can be retried without inventing another conversation or new IDs.
-
-The existing optional `server.py` on main is a different append interface. Its `store_memory` does not provide this remote `save_memory` contract or conversation reconciliation.
-
-## Staged prompts for the builder
-
-After the initial prompt in the main guide, use these if work needs to be split between a cloud builder and a local coding task.
-
-**Gateway task:**
-
-```text
-Build my private ThreadSatchel Sites gateway from PRIVATE_GATEWAY.md.
-Implement owner authorization, the complete six-tool contract with writes
-initially disabled, durable bounded operations, and a separately authenticated
-poll/complete connector API. Keep tool discovery free of private data.
-Test with a fake local worker and synthetic payloads. Include concurrent
-request-key conflicts, stale lease completions, other-owner denial, expiry,
-oversized streams, and full cursor round trips. Produce the exact connector
-wire contract, configuration field names, private deployment, and runbook.
-Use Sites' canonical private plugin, without a second wrapper plugin.
-```
-
-**Local task:**
-
-```text
-Build my outbound ThreadSatchel connector against the gateway contract at
-[LOCAL_CONTRACT_PATH], using archive [ARCHIVE_ROOT] and Python [PYTHON_PATH].
-Implement protected configuration, a single-worker lock, allowlisted reads,
-and durable importer-backed saves as described in PRIVATE_GATEWAY.md.
-Use a disposable archive for tests. Verify exact text, retry safety after
-lost responses and process restarts, changed-content conflicts, and offline
-recovery. Produce a working configuration helper and startup/status/stop
-commands, then connect to my private gateway and verify a harmless read.
-```
-
-**Integration task:**
-
-```text
-Verify my deployed gateway and local connector together using the acceptance
-checks in CREATE_YOUR_OWN_PLUGIN.md. Confirm read-only access first, then
-enable save_memory only after the durable save tests pass. Reuse the current
-private plugin, verify its discovered schemas, and give me its install link.
-Record which checks actually passed in a connected chat and which still
-need testing in Dot. Do not report queued operations as completed saves.
-```
-
-## Optional file handoffs
-
-The author's installation also supports named, versioned file handoffs. They are not needed for search, inventory, Dot access, or conversation saves. If you want them, separately implement `list_handoffs`, `get_handoff`, `read_handoff_file`, and `save_handoff` with explicit versions, byte limits, hashes, and keyed retries.
-
-Keep all files under a dedicated `handoffs/` root; reject absolute/UNC paths, traversal, symlinks, junctions, hidden staging files, and reserved filenames. Return bounded byte ranges for large files and never execute retrieved files. Preserve prior versions, index the instructions through the importer, and give the user a pickup name only after both storage and indexing are confirmed. Test interrupted writes before enabling these extra tools.
-
-## Completion criteria
-
-Your build is complete when your private Site is deployed, the connector restarts reliably under your account, the personal plugin is installed, and the applicable acceptance checks pass through that plugin. Record Dot verification separately. Preserve your source, dependency lockfile, migration history, and private runbook so you can maintain the integration without the original author's involvement.
+For scheduled operation, run the continuous command with your operating system's service manager under the archive owner account. Rotate credentials through the matching Wrangler secret and client or connector configuration. On Windows, create a replacement DPAPI file in the existing private configuration directory so its write receipts remain available. Restart the connector to load the replacement configuration or new Python source.

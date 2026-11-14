@@ -6,7 +6,7 @@ It uses Python, SQLite/FTS5, and MCP. It can import notes and conversation excer
 
 One thing I cared about was avoiding duplicates when smaller imports overlap a later export. Repeated imports are safe, matching source IDs reuse existing records, and uncertain matches are kept for review rather than blindly merged. Originals and provenance stay preserved.
 
-It's an early release, with setup instructions and tests. It isn't universal automatic ChatGPT/Claude chat capture or semantic memory, and full OpenAI export support still needs validation against a real dump.
+It's an early release, with setup instructions and tests. The core works offline. Optional local models add semantic search, and supported OpenAI conversation exports can be imported directly.
 
 GitHub: https://github.com/stevej52/threadsatchel
 

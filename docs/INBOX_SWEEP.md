@@ -38,9 +38,7 @@ schedule `python inbox_sweep.py` using their own scheduler.
    old, then imports it on an eligible pass. Allow about two to three minutes
    under normal load; held files and a backlog can take longer.
 
-Use the existing JSON packet format. The public importer accepts
-`threadsatchel/1` and its `steve-memory/1` compatibility alias. Local installations
-that still use only `steve-memory/1` can use this same sweep unchanged. TXT and
+Use the public `threadsatchel/1` JSON packet format. TXT and
 Markdown become notes unless already imported with explicit metadata. Use JSON
 when you need summary/excerpt labels and source metadata.
 
@@ -62,7 +60,7 @@ file.
 Files stay in the inbox. Their unchanged original bytes, SHA-256 and input path
 are stored in the existing archive. Successful matching import receipts are
 skipped on later passes. A renamed/redelivered packet goes through the existing
-deduplication rules. No separate memory database or new database schema is used.
+deduplication rules. The separate recovery journal stores processing state.
 
 Each run checks a roughly one-minute work budget between files and imports at
 most 50 files. SQLite commits remain atomic. After a crash or timeout, the next
@@ -90,11 +88,9 @@ matches or warnings is recorded as imported with those counters; inspect the
 importer's provenance and uncertainty records as needed. No input file is
 deleted or executed.
 
-Before each batch that needs to import files, the sweep creates and verifies a
-SQLite online backup in `backups/inbox-sweep/`. It retains the newest eight of
-its own verified backups. It never prunes other backup directories, the archive,
-or deposited files. Sweeps with only already-imported or held files do not create
-database backups.
+Before an import, the sweep makes a verified SQLite online backup or reuses its latest completed snapshot from the past hour. It keeps four completed snapshots in `backups/inbox-sweep/`. The sweep lock protects cleanup of its interrupted partial copies. The local status files `backup-status.json`, `backup-cleanup.json` and `backup-retention.json` in `inbox-sweep/` record copy progress and cleanup failures. For daily backups to another disk, see [Backups and recovery](BACKUPS.md).
+
+The sweep journals import attempts in `inbox-sweep/recovery.sqlite3`, outside the archive database. An interrupted pass or a missing previously observed receipt places affected files on hold before normal scanning resumes. Follow the restore and replay instructions in [Backups and recovery](BACKUPS.md).
 
 ## Pause and resume
 
@@ -112,4 +108,4 @@ Linux: `systemctl --user disable --now threadsatchel-inbox.timer`; resume with
 
 Disabling the schedule lets an active pass finish. For a persistent stop checked
 between files, create `inbox-sweep/disabled.flag`; remove only that flag when
-ready to resume. None of these controls stop the remote-access watchdog.
+ready to resume.

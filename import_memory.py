@@ -23,7 +23,8 @@ PACKET_FIELDS = frozenset({'format', 'kind', 'title', 'account_id', 'conversatio
 MESSAGE_FIELDS = frozenset({'text', 'speaker', 'message_id', 'source_order', 'source_date', 'source_url'})
 IMPORT_ERROR_MESSAGES = {
     'invalid_packet': 'Packet must be an object.',
-    'unsupported_format': 'Expected format threadsatchel/1 or steve-memory/1.',
+    'unsupported_zip_compression': 'Conversation ZIP files must use STORED or DEFLATED compression.',
+    'unsupported_format': 'Expected a ThreadSatchel version 1 packet.',
     'invalid_kind': 'kind must be excerpt, summary, or note.',
     'invalid_metadata': 'A supported metadata field has an invalid value.',
     'invalid_messages': 'messages must be a nonempty list.',
@@ -218,10 +219,12 @@ def validate_packet(p):
         raise ImportValidationError('invalid_packet')
     validate_json_values(p)
     allowed = PACKET_FIELDS
-    if p.get('format', 'threadsatchel/1') not in ('threadsatchel/1', 'steve-memory/1'):
+    marker = p.get('format', 'threadsatchel/1')
+    # Older installations used a site-specific namespace for this same v1 schema.
+    if not isinstance(marker, str) or (marker != 'threadsatchel/1' and
+            not re.fullmatch(r'[a-z][a-z0-9-]{0,39}-memory/1', marker)):
         raise ImportValidationError('unsupported_format', '$.format')
-    # Keep the legacy canonical marker stable so existing packet hashes still deduplicate.
-    p = dict(p, format='steve-memory/1', kind=p.get('kind', 'excerpt'))
+    p = dict(p, format='threadsatchel/1', kind=p.get('kind', 'excerpt'))
     if not isinstance(p['kind'], str) or p['kind'] not in KINDS:
         raise ImportValidationError('invalid_kind', '$.kind')
     for k in allowed - {'messages', 'derived_from'}:
@@ -297,6 +300,11 @@ def export_packets(raw, account_id=None, *, max_expanded_bytes=MAX_EXPANDED_BYTE
             raise ValueError('ZIP must contain conversations.json or numbered conversation parts')
         if any(entry.is_dir() or entry.flag_bits & 1 for entry in selected):
             raise ValueError('Expected unencrypted conversation JSON files')
+        # Reject all selected members before opening any decompressor. In
+        # particular, bounded reads do not bound BZIP2/LZMA internal allocation.
+        if any(entry.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+               for entry in selected):
+            raise ImportValidationError('unsupported_zip_compression')
         if sum(entry.file_size for entry in selected) > max_expanded_bytes:
             raise ValueError('Expanded conversation JSON exceeds configured size limit')
         conversations, remaining = [], max_expanded_bytes
@@ -511,8 +519,15 @@ def import_file(path, db_path=ROOT/'memory.sqlite3', *, max_file_bytes=MAX_FILE_
             for warning in warnings:
                 db.execute('INSERT OR IGNORE INTO import_warnings VALUES(?,?)', (sha,encoded(warning).decode()))
             db.execute('INSERT INTO import_receipts VALUES(?,?,?,?,?) ON CONFLICT(object_sha,path,options_json) DO UPDATE SET last_seen=excluded.last_seen', (sha,str(path),encoded(options).decode(),stamp,stamp))
+            # Prior releases used one installation-wide namespace when hashing
+            # packets. Preserve those keys and their provenance on re-import.
+            historical = db.execute("SELECT json_extract(metadata_json,'$.format') FROM import_packets ORDER BY rowid LIMIT 1").fetchone()
             for p in packets:
                 key = digest(encoded(p))
+                if historical and historical[0] and historical[0] != p['format']:
+                    old_key = digest(encoded(dict(p, format=historical[0])))
+                    if db.execute('SELECT 1 FROM import_packets WHERE packet_key=?', (old_key,)).fetchone():
+                        key = old_key
                 if db.execute('SELECT 1 FROM import_packets WHERE packet_key=?', (key,)).fetchone():
                     db.execute('INSERT OR IGNORE INTO import_packet_sources VALUES(?,?)', (key,sha))
                     result['repeated_packets'] += 1

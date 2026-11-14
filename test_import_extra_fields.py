@@ -31,7 +31,7 @@ class ExtraFieldImportTests(unittest.TestCase):
         return path
 
     def test_extra_fields_are_exact_inert_metadata_with_safe_persistent_notes(self):
-        packet = {'format': 'steve-memory/1', 'kind': 'excerpt',
+        packet = {'format': 'threadsatchel/1', 'kind': 'excerpt',
                   'provenance': {'origin': 'SYNTHETIC private context',
                                  'nested': [None, True, 1, 2.5, {'key': '\u2603'}]},
                   'notes': 'SYNTHETIC supplied note',
@@ -93,9 +93,22 @@ class ExtraFieldImportTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT count(*) FROM memory_fts').fetchone()[0], 1)
             self.assertEqual(db.execute('SELECT count(*) FROM import_warnings').fetchone()[0], 2)
 
-    def test_standard_canonical_hash_is_unchanged_and_extra_identity_is_inert(self):
+    def test_historical_packet_hash_is_reused_by_public_namespace(self):
+        packet = {'format':'threadsatchel/1', 'kind':'note', 'messages':[{'text':'SYNTHETIC historical note'}]}
+        path = self.write(packet)
+        import_memory.import_file(path, self.db)
+        old_packet = dict(packet, format='fixture-memory/1')
+        old_key = import_memory.digest(import_memory.encoded(old_packet))
+        with closing(sqlite3.connect(self.db)) as db, db:
+            for table in ('import_packets','import_items','import_packet_sources'):
+                db.execute('UPDATE '+table+' SET packet_key=?', (old_key,))
+            db.execute('UPDATE import_packets SET metadata_json=?', (import_memory.encoded(old_packet).decode(),))
+        result = import_memory.import_file(path, self.db)
+        self.assertEqual((result['repeated_packets'],result['added_revisions']), (1,0))
+
+    def test_public_canonical_hash_and_extra_identity_is_inert(self):
         packet = {'format': 'threadsatchel/1', 'messages': [{'text': 'SYNTHETIC stable canonical'}]}
-        expected = dict(packet, format='steve-memory/1', kind='excerpt')
+        expected = dict(packet, format='threadsatchel/1', kind='excerpt')
         expected_bytes = json.dumps(expected, sort_keys=True, ensure_ascii=False,
                                     separators=(',', ':')).encode('utf-8')
         result = import_memory.import_file(self.write(packet), self.db)

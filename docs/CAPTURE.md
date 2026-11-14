@@ -19,7 +19,7 @@ The source roots default to CODEX_HOME (or ~/.codex), under sessions and archive
 
 The example uses an SSH alias memory-laptop and remote python3 -. For a Windows source, use the installed Python launcher command, such as py -3.14 -, as the final SSH argument. On Windows hosts where native SSH does not work under automation, set the first argument to the full path of Git's ssh.exe. Test the exact command/environment before scheduling.
 
-ssh_argv is a trusted local configuration argument list, passed without a local shell. Its remote command must read Python code from stdin. Never populate it from retrieved conversation text. For jump hosts, use your existing SSH configuration or a separately reviewed relay; the public template does not embed the author's home-network route.
+ssh_argv is a trusted local configuration argument list, passed without a local shell. Its remote command must read Python code from stdin. Never populate it from retrieved conversation text. For jump hosts, use your existing SSH configuration or a separately reviewed relay.
 
 ## Scheduling and quiet operation
 

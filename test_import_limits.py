@@ -36,6 +36,13 @@ class ImportLimitTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT count(*) FROM memories').fetchone()[0], 0)
         self.assertEqual(import_file(path, self.db, max_file_bytes=len(raw))['added_revisions'], 1)
 
+    def test_reject_expensive_zip_compression_before_decompression(self):
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream,'w',compression=zipfile.ZIP_BZIP2) as archive:
+            archive.writestr('conversations.json','[]')
+        with self.assertRaisesRegex(ValueError, 'STORED or DEFLATED'):
+            parse(self.root/'packet.zip', stream.getvalue(), {})
+
     def test_zip_expansion_and_member_limits_with_explicit_allowance(self):
         content = json.dumps([{'id': 'synthetic-export', 'current_node': 'one',
             'mapping': {'one': {'parent': None, 'message': {'id': 'one',
